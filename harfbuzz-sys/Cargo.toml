@@ -1,0 +1,67 @@
+[package]
+name = "harfbuzz-sys"
+description = "Raw FFI bindings to HarfBuzz, with a vendored source build"
+build = "build.rs"
+links = "harfbuzz"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# `harfbuzz/` is a git submodule holding the upstream sources we compile. Only
+# the parts the build script actually reads are packaged.
+exclude = ["harfbuzz/test", "harfbuzz/perf", "harfbuzz/docs", "harfbuzz/util"]
+
+[features]
+default = ["subset"]
+
+# --- HarfBuzz sub-libraries -------------------------------------------------
+# These map one-to-one onto upstream's `HB_HAS_*` build switches. Each adds
+# source files to the amalgamation and a matching `pub mod` of FFI items.
+
+# Font subsetting and instancing (`hb-subset.h`).
+subset = []
+# CPU glyph rasterization (`hb-raster.h`).
+raster = []
+# Vector glyph output: SVG and PDF (`hb-vector.h`).
+vector = []
+# GPU-oriented glyph outline extraction (`hb-gpu.h`).
+gpu = []
+
+# --- Platform and third-party back ends -------------------------------------
+# Unlike the sub-libraries above, these need a system library to be present.
+# The build script locates each one with `pkg-config` (except CoreText, which
+# is an Apple system framework).
+
+# Apple CoreText shaper and font backend (`hb-coretext.h`). Apple targets only.
+coretext = []
+# FreeType font backend (`hb-ft.h`).
+freetype = []
+# Graphite2 complementary shaper (`hb-graphite2.h`).
+graphite2 = []
+# ICU Unicode functions (`hb-icu.h`).
+icu = []
+# GLib Unicode functions (`hb-glib.h`).
+glib = []
+
+# --- Codecs -----------------------------------------------------------------
+# Optional helpers for the raster and vector back ends. Without them those
+# back ends still build; they just cannot read PNG or emit compressed PDF.
+png = []
+zlib = []
+
+# --- Upstream-unstable API --------------------------------------------------
+# Turns on `HB_EXPERIMENTAL_API`. Upstream makes no compatibility promise for
+# anything this exposes, so the symbols it adds may vanish in a point release.
+experimental = []
+
+# --- Size-reduction profiles ------------------------------------------------
+# These correspond to the pre-defined configurations in upstream's CONFIG.md.
+# They shrink the library by REMOVING functionality, which means they also
+# remove public symbols. Bindings for a removed function stay declared here but
+# will fail to link if you call them, so treat these as expert options and
+# verify the resulting binary. The build script warns when one is enabled.
+mini = []
+lean = []
+tiny = []

@@ -1,0 +1,25 @@
+# Cross-language LTO configuration for this workspace.
+#
+# `harfbuzz-sys/build.rs` compiles HarfBuzz to LLVM bitcode so the C++ and Rust
+# halves can be optimized together at link time. Bitcode is only readable by an
+# LLVM at least as new as the one that produced it, and Apple's `ld64` bundles
+# its own older libLTO, so a stock link fails with:
+#
+#     ld: could not parse bitcode object file ...: 'Unknown attribute kind ...'
+#
+# `-lto_library` is Darwin's supported way to hand `ld64` a different libLTO.
+# Pointing it at the same LLVM that compiled HarfBuzz keeps the producer and
+# the consumer of the bitcode in step, without replacing the system linker.
+#
+# Relocating the toolchain: change the path below, and set
+# `HARFBUZZ_SYS_LLVM_TOOLCHAIN` to the same install root so the build script
+# uses it too. To opt out entirely, delete this file and build with
+# `HARFBUZZ_SYS_LTO=off`.
+
+[target.aarch64-apple-darwin]
+rustflags = [
+  "-Clink-arg=-Wl,-lto_library,/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/lib/libLTO.dylib",
+  # Completes the -ffunction-sections / -fdata-sections story from build.rs by
+  # letting the linker drop everything nothing references.
+  "-Clink-arg=-Wl,-dead_strip",
+]

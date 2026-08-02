@@ -1,0 +1,60 @@
+[workspace]
+members = ["harfbuzz-sys"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/Chord-Ink/harfbuzz-rs"
+rust-version = "1.85"
+
+[package]
+name = "harfbuzz-rs"
+description = "Safe, idiomatic Rust bindings for the HarfBuzz text shaping engine"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harfbuzz-sys = { path = "harfbuzz-sys", version = "0.1.0", default-features = false }
+
+[features]
+default = ["subset"]
+
+# HarfBuzz optional sub-libraries. Each one turns on an additional slice of the
+# C library and the Rust module that wraps it.
+subset = ["harfbuzz-sys/subset"]
+raster = ["harfbuzz-sys/raster"]
+vector = ["harfbuzz-sys/vector"]
+gpu = ["harfbuzz-sys/gpu"]
+
+# Platform / third-party shaper and font backends.
+coretext = ["harfbuzz-sys/coretext"]
+freetype = ["harfbuzz-sys/freetype"]
+graphite2 = ["harfbuzz-sys/graphite2"]
+icu = ["harfbuzz-sys/icu"]
+glib = ["harfbuzz-sys/glib"]
+
+# Codec support used by the raster and vector back ends.
+png = ["harfbuzz-sys/png"]
+zlib = ["harfbuzz-sys/zlib"]
+
+# HarfBuzz APIs that upstream has not committed to yet.
+experimental = ["harfbuzz-sys/experimental"]
+
+[profile.release]
+# Cross-language LTO: HarfBuzz is compiled to LLVM bitcode by build.rs, so the
+# final link is where C++ and Rust get optimized together.
+lto = true
+codegen-units = 1
+panic = "abort"
+# HarfBuzz is built with -Oz; matching that on the Rust side keeps the whole
+# image small. Debug symbols are deliberately retained (see .cargo/config.toml).
+opt-level = "z"
+strip = false
+debug = true
+
+[profile.dev]
+debug = true
