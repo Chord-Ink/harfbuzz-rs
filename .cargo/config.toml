@@ -17,6 +17,10 @@ CXX = "/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/clang
 # cannot read.
 AR = "/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/llvm-ar"
 NM = "/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/llvm-nm"
+# Apple's clang knows where the SDK is; a standalone LLVM clang does not, and
+# fails on the first system header. Clang reads SDKROOT natively. The path is
+# version-independent, so it survives Xcode updates.
+SDKROOT = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
 
 # Cross-language LTO is opt-in and is NOT enabled here.
 #

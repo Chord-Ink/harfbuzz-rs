@@ -47,9 +47,16 @@
 //! | ---------------------------- | --------------------------------------------- |
 //! | `CXX`, `CXXFLAGS`            | Compiler and extra flags (read by `cc`)        |
 //! | `AR`                         | Archiver (read by `cc`)                        |
+//! | `NM`                         | Symbol reader, for `tests/symbols.rs`          |
 //! | `CARGO_ENCODED_RUSTFLAGS`    | Inspected for `-Clinker-plugin-lto`            |
 //! | `MACOSX_DEPLOYMENT_TARGET`   | Minimum macOS version (read by `cc`)           |
+//! | `SDKROOT`                    | Apple SDK, when `CXX` is not Apple's clang     |
 //! | `PKG_CONFIG_PATH`            | Where to find optional system libraries        |
+//!
+//! `SDKROOT` deserves a word. Apple's own clang knows where the SDK is; a
+//! standalone LLVM clang does not, and fails on the first system header with
+//! `'inttypes.h' file not found`. Clang reads `SDKROOT` itself, so setting it
+//! alongside `CXX` is all that is needed — this script does not go looking.
 
 use std::env;
 use std::fmt::Write as _;
@@ -155,10 +162,6 @@ fn base_build(hb_src: &Path, out_dir: &Path, features: &Features) -> cc::Build {
         .include(out_dir)
         .define("HAVE_CONFIG_H", None);
 
-    if let Some(sdk) = apple_sdk_path() {
-        build.flag("-isysroot").flag(&sdk);
-    }
-
     // ICU 75 and later need C++17 in their public headers; upstream's meson
     // build special-cases this the same way.
     let needs_cxx17 = features
@@ -238,45 +241,6 @@ fn base_build(hb_src: &Path, out_dir: &Path, features: &Features) -> cc::Build {
     }
 
     build
-}
-
-/// Locate the Apple SDK, for compilers that do not know where it is.
-///
-/// Apple's own clang has the SDK path baked in, and `cc` relies on that, so it
-/// passes no `-isysroot` for a macOS host build. A standalone LLVM clang has no
-/// such default and fails on the very first system header. Since pointing an
-/// LLVM toolchain at this crate is the supported way to get cross-language LTO,
-/// the sysroot has to be supplied explicitly.
-///
-/// Returns `None` off Apple platforms, and when `SDKROOT` is already set —
-/// clang honours that itself, and overriding it would ignore the user.
-fn apple_sdk_path() -> Option<String> {
-    if env::var("CARGO_CFG_TARGET_VENDOR").as_deref() != Ok("apple") {
-        return None;
-    }
-
-    if env::var_os("SDKROOT").is_some() {
-        return None;
-    }
-
-    let sdk = match env::var("CARGO_CFG_TARGET_OS").as_deref() {
-        Ok("ios") => "iphoneos",
-        Ok("tvos") => "appletvos",
-        Ok("watchos") => "watchos",
-        Ok("visionos") => "xros",
-        _ => "macosx",
-    };
-
-    let output = Command::new("xcrun")
-        .args(["--sdk", sdk, "--show-sdk-path"])
-        .output()
-        .ok()?;
-
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|path| !path.is_empty())
 }
 
 // ---------------------------------------------------------------------------
