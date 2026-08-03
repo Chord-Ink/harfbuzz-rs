@@ -1,45 +1,55 @@
 //! Build script for `harfbuzz-sys`: compiles the vendored HarfBuzz sources into
 //! a static archive and tells Cargo how to link it.
 //!
-//! # Why this does not use the `cc` crate
+//! # What gets compiled
 //!
-//! This project takes no dependencies it does not need, and the amount of work
-//! here is small: HarfBuzz ships an *amalgamation* (`src/harfbuzz-world.cc`)
-//! that `#include`s every other translation unit, so the whole library is a
-//! single compiler invocation. Driving `clang++` directly also lets us pin an
-//! exact toolchain, which matters for the LTO story below.
+//! HarfBuzz is a C++ project — upstream's `meson.build` declares
+//! `project('harfbuzz', ['c', 'cpp'])` with `cpp_std=c++11`, and `src/` holds
+//! 137 `.cc` files against 50 `.h`. It ships an *amalgamation*,
+//! `src/harfbuzz-world.cc`, which `#include`s every other translation unit
+//! behind `HB_HAS_*` guards. Compiling that one file builds the whole library,
+//! and it makes the Cargo features here map one-for-one onto upstream's build
+//! switches.
 //!
-//! # Toolchain pinning and cross-language LTO
+//! # Compiler selection
 //!
-//! When HarfBuzz is compiled with `-flto`, the object file contains LLVM
-//! bitcode rather than machine code. Bitcode is only forward-compatible: a
-//! linker whose LLVM is *older* than the producer cannot read it. Apple's
-//! `ld64` ships its own libLTO (LLVM 21 as of Xcode 26), so bitcode from a
-//! newer upstream LLVM fails to link with the error
+//! Everything goes through the `cc` crate, so the usual conventions apply and
+//! nothing is hard-coded. Because the build is C++, the compiler comes from
+//! **`CXX`** (or `CXX_<target>`), not `CC`:
 //!
-//! ```text
-//! ld: could not parse bitcode object file ...: 'Unknown attribute kind ...'
+//! ```sh
+//! CXX=/path/to/llvm/bin/clang++ cargo build
 //! ```
 //!
-//! To make cross-language LTO work, the C++ side must be compiled by the *same*
-//! LLVM that `rustc` embeds. This script therefore
+//! # Cross-language LTO
 //!
-//! 1. locates a pinned LLVM toolchain (see [`Toolchain::discover`]),
-//! 2. compares its major version against the LLVM `rustc` reports, and
-//! 3. only emits bitcode when the two agree — otherwise it falls back to plain
-//!    machine-code objects so the build still succeeds, just without LTO.
+//! LTO is not something this crate can decide on its own. Cross-language LTO
+//! only happens when the *consumer* passes `-Clinker-plugin-lto`, which makes
+//! `rustc` emit LLVM bitcode instead of machine code. This script looks for
+//! that flag in `CARGO_ENCODED_RUSTFLAGS` and, when it is present, compiles
+//! HarfBuzz to bitcode too by adding `-flto`, so the linker can optimize across
+//! the language boundary.
 //!
-//! Consumers additionally need `-Clinker-plugin-lto` and a matching linker; see
-//! `.cargo/config.toml` in the repository root for a working configuration.
+//! Two conditions gate it:
+//!
+//! * **The compiler must be genuine LLVM Clang.** GCC's LTO objects use a
+//!   different format entirely, and Apple Clang's bitcode is tied to the LLVM
+//!   inside Xcode rather than the one `rustc` embeds. In either case this
+//!   script warns and compiles normally.
+//! * **Without `-Clinker-plugin-lto` there is no `-flto`.** Emitting bitcode
+//!   that the consumer's linker was never told to expect turns a working build
+//!   into a link failure, and a build script cannot fix a downstream link:
+//!   Cargo does not propagate `rustc-link-arg` to dependents.
 //!
 //! # Environment variables
 //!
-//! | Variable                        | Effect                                          |
-//! | ------------------------------- | ----------------------------------------------- |
-//! | `HARFBUZZ_SYS_LLVM_TOOLCHAIN`   | Path to an LLVM install (the dir holding `bin/`) |
-//! | `HARFBUZZ_SYS_LTO`              | `thin` (default), `full`, or `off`               |
-//! | `HARFBUZZ_SYS_NO_DEBUG_INFO`    | Set to any value to drop `-g`                    |
-//! | `MACOSX_DEPLOYMENT_TARGET`      | Minimum macOS version to target                  |
+//! | Variable                     | Effect                                        |
+//! | ---------------------------- | --------------------------------------------- |
+//! | `CXX`, `CXXFLAGS`            | Compiler and extra flags (read by `cc`)        |
+//! | `AR`                         | Archiver (read by `cc`)                        |
+//! | `CARGO_ENCODED_RUSTFLAGS`    | Inspected for `-Clinker-plugin-lto`            |
+//! | `MACOSX_DEPLOYMENT_TARGET`   | Minimum macOS version (read by `cc`)           |
+//! | `PKG_CONFIG_PATH`            | Where to find optional system libraries        |
 
 use std::env;
 use std::fmt::Write as _;
@@ -47,11 +57,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-
-/// Where the pinned toolchain lives when the user has not said otherwise.
-/// `rustc` 1.96 embeds LLVM 22.1.2, so this is the version that lets bitcode
-/// flow from C++ into a Rust link.
-const CANONICAL_TOOLCHAIN: &str = "Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64";
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -70,25 +75,44 @@ fn main() {
         );
     }
 
-    let target = Target::from_env();
-    let features = Features::from_env(&target);
-    let toolchain = Toolchain::discover(&target);
-
+    let features = Features::from_env();
     features.warn_about_size_profiles();
 
-    // Probe the host/target the way upstream's meson build does, rather than
+    let mut build = base_build(&hb_src, &out_dir, &features);
+
+    // `get_compiler` resolves CXX, the target triple, and the sysroot, so it has
+    // to happen after the target-affecting settings are in place.
+    let compiler = build.get_compiler();
+    let kind = CompilerKind::detect(compiler.path());
+
+    if let Some(flag) = lto_flag(kind) {
+        build.flag(flag);
+        // With `-flto` the object file is LLVM bitcode, which has no native
+        // symbol table. Only an LLVM-aware archiver can index it; a plain `ar`
+        // yields an archive the linker reads as empty.
+        if let Some(llvm_ar) = find_llvm_ar(compiler.path()) {
+            build.archiver(llvm_ar);
+        } else {
+            println!(
+                "cargo::warning=harfbuzz-sys: emitting LLVM bitcode but could not find `llvm-ar`. \
+                 If the link reports undefined HarfBuzz symbols, set AR to your toolchain's \
+                 llvm-ar."
+            );
+        }
+    }
+
+    // Probe the target the way upstream's meson build does, rather than
     // hard-coding a table of what each platform is assumed to provide.
-    let probes = Probe::run_all(&toolchain, &target);
-    let config_h = out_dir.join("config.h");
-    fs::write(&config_h, render_config_h(&probes, &features)).expect("write config.h");
+    let probes = Probe::run_all(&compiler, &out_dir);
+    fs::write(out_dir.join("config.h"), render_config_h(&probes, &features))
+        .expect("write config.h");
 
-    let lto = LtoMode::resolve(&toolchain);
-    let object = compile(&toolchain, &target, &features, &lto, &hb_src, &out_dir);
-    let archive = archive(&toolchain, &object, &out_dir);
+    // `compile` also emits the link-lib and link-search directives for us.
+    build.compile("harfbuzz");
 
-    emit_link_directives(&target, &features, &archive, &out_dir);
-    emit_lto_linker_directives(&toolchain, &lto);
-    emit_metadata(&hb_root, &lto, &toolchain);
+    emit_extra_link_directives(&features);
+    emit_test_env(&out_dir, compiler.path());
+    emit_metadata(&hb_src, kind);
 }
 
 // ---------------------------------------------------------------------------
@@ -98,8 +122,8 @@ fn main() {
 /// Tell Cargo the narrow set of inputs that can change what we produce.
 ///
 /// Pointing `rerun-if-changed` at the source *directory* is deliberate: Cargo
-/// walks it recursively, so adding or editing any vendored file (for instance
-/// by moving the submodule to a different tag) invalidates the build.
+/// walks it recursively, so moving the submodule to a different tag invalidates
+/// the build.
 fn rerun_directives(manifest_dir: &Path, hb_src: &Path) {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed={}", hb_src.display());
@@ -108,214 +132,279 @@ fn rerun_directives(manifest_dir: &Path, hb_src: &Path) {
         manifest_dir.join("Cargo.toml").display()
     );
 
-    for var in [
-        "HARFBUZZ_SYS_LLVM_TOOLCHAIN",
-        "HARFBUZZ_SYS_LTO",
-        "HARFBUZZ_SYS_NO_DEBUG_INFO",
-        "MACOSX_DEPLOYMENT_TARGET",
-        "CXX",
-        "AR",
+    // `cc` already watches CXX and friends, but the LTO decision is ours and it
+    // reads the encoded rustflags.
+    println!("cargo::rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+    println!("cargo::rerun-if-env-changed=RUSTFLAGS");
+    println!("cargo::rerun-if-env-changed=PKG_CONFIG_PATH");
+}
+
+// ---------------------------------------------------------------------------
+// The compile
+// ---------------------------------------------------------------------------
+
+/// Configure everything about the build that does not depend on knowing which
+/// compiler `cc` resolved.
+fn base_build(hb_src: &Path, out_dir: &Path, features: &Features) -> cc::Build {
+    let mut build = cc::Build::new();
+
+    build
+        .cpp(true)
+        .file(hb_src.join("harfbuzz-world.cc"))
+        .include(hb_src)
+        // Where `config.h` lands.
+        .include(out_dir)
+        .define("HAVE_CONFIG_H", None);
+
+    if let Some(sdk) = apple_sdk_path() {
+        build.flag("-isysroot").flag(&sdk);
+    }
+
+    // ICU 75 and later need C++17 in their public headers; upstream's meson
+    // build special-cases this the same way.
+    let needs_cxx17 = features
+        .icu
+        .as_ref()
+        .and_then(PkgConfig::major)
+        .is_some_and(|v| v >= 75);
+    build.std(if needs_cxx17 { "c++17" } else { "c++11" });
+
+    // Matched to upstream's meson defaults. RTTI stays on when ICU is linked,
+    // because ICU's headers use it — upstream's meson.build carries the same
+    // caveat.
+    build.flag_if_supported("-fno-exceptions");
+    if features.icu.is_none() {
+        build.flag_if_supported("-fno-rtti");
+    }
+    build.flag_if_supported("-fno-threadsafe-statics");
+    build.flag_if_supported("-fvisibility-inlines-hidden");
+
+    // Size first, as requested. `-ffunction-sections`/`-fdata-sections` give
+    // the linker symbol-granularity dead stripping; rustc already passes
+    // `-Wl,-dead_strip` (Mach-O) and `--gc-sections` (ELF) by default, so there
+    // is nothing to add on the link side.
+    build.opt_level_str("z");
+    build.flag_if_supported("-ffunction-sections");
+    build.flag_if_supported("-fdata-sections");
+
+    // The `debug` feature owns this, rather than Cargo's profile, so that a
+    // release build can still carry a debuggable HarfBuzz.
+    build.debug(features.debug);
+    if features.debug {
+        // Frame pointers keep stacks walkable for profilers that do not parse
+        // DWARF. Mandatory on arm64 anyway; stating it keeps other targets
+        // consistent.
+        build.flag_if_supported("-fno-omit-frame-pointer");
+    }
+
+    // HarfBuzz builds clean upstream but warns freely under our flags, and
+    // those warnings are not actionable from here.
+    build.warnings(false);
+    build.extra_warnings(false);
+
+    // The `HB_HAS_*` switches the amalgamation dispatches on. These must be
+    // defined on the command line: `harfbuzz-world.cc` tests them before it
+    // includes anything, so `config.h` would be too late.
+    for (enabled, macro_name) in [
+        (features.subset, "HB_HAS_SUBSET"),
+        (features.raster, "HB_HAS_RASTER"),
+        (features.vector, "HB_HAS_VECTOR"),
+        (features.gpu, "HB_HAS_GPU"),
+        (features.coretext, "HB_HAS_CORETEXT"),
+        (features.freetype.is_some(), "HB_HAS_FREETYPE"),
+        (features.graphite2.is_some(), "HB_HAS_GRAPHITE"),
+        (features.icu.is_some(), "HB_HAS_ICU"),
+        (features.glib.is_some(), "HB_HAS_GLIB"),
     ] {
-        println!("cargo::rerun-if-env-changed={var}");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Target
-// ---------------------------------------------------------------------------
-
-/// The platform we are compiling *for*, translated from Cargo's vocabulary into
-/// clang's.
-struct Target {
-    /// The Rust triple, e.g. `aarch64-apple-darwin`.
-    triple: String,
-    /// `CARGO_CFG_TARGET_OS`, e.g. `macos`.
-    os: String,
-    /// `CARGO_CFG_TARGET_ARCH`, e.g. `aarch64`.
-    arch: String,
-    /// True for macOS/iOS/tvOS/watchOS/visionOS, which share Mach-O, the
-    /// Apple SDK layout, and `-dead_strip`.
-    is_apple: bool,
-}
-
-impl Target {
-    fn from_env() -> Self {
-        let os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS");
-        let is_apple = env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple");
-
-        Self {
-            triple: env::var("TARGET").expect("TARGET"),
-            arch: env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH"),
-            os,
-            is_apple,
+        if enabled {
+            build.define(macro_name, "1");
         }
     }
 
-    /// The triple to hand clang.
+    // Size profiles from upstream's CONFIG.md.
+    for (enabled, macro_name) in [
+        (features.tiny, "HB_TINY"),
+        (features.lean, "HB_LEAN"),
+        (features.mini, "HB_MINI"),
+    ] {
+        if enabled {
+            build.define(macro_name, "1");
+        }
+    }
+
+    for pkg in features.pkg_configs() {
+        for flag in &pkg.cflags {
+            build.flag(flag);
+        }
+    }
+
+    build
+}
+
+/// Locate the Apple SDK, for compilers that do not know where it is.
+///
+/// Apple's own clang has the SDK path baked in, and `cc` relies on that, so it
+/// passes no `-isysroot` for a macOS host build. A standalone LLVM clang has no
+/// such default and fails on the very first system header. Since pointing an
+/// LLVM toolchain at this crate is the supported way to get cross-language LTO,
+/// the sysroot has to be supplied explicitly.
+///
+/// Returns `None` off Apple platforms, and when `SDKROOT` is already set —
+/// clang honours that itself, and overriding it would ignore the user.
+fn apple_sdk_path() -> Option<String> {
+    if env::var("CARGO_CFG_TARGET_VENDOR").as_deref() != Ok("apple") {
+        return None;
+    }
+
+    if env::var_os("SDKROOT").is_some() {
+        return None;
+    }
+
+    let sdk = match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("ios") => "iphoneos",
+        Ok("tvos") => "appletvos",
+        Ok("watchos") => "watchos",
+        Ok("visionos") => "xros",
+        _ => "macosx",
+    };
+
+    let output = Command::new("xcrun")
+        .args(["--sdk", sdk, "--show-sdk-path"])
+        .output()
+        .ok()?;
+
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|path| !path.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// LTO
+// ---------------------------------------------------------------------------
+
+/// Which compiler `cc` resolved, to the precision the LTO decision needs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CompilerKind {
+    /// Upstream LLVM Clang.
+    Clang,
+    /// Apple's fork, shipped with Xcode. Its bitcode belongs to the LLVM inside
+    /// Xcode, which is not the one `rustc` embeds.
+    AppleClang,
+    /// GCC, or anything claiming to be it.
+    Gnu,
+    /// Anything unrecognised.
+    Other,
+}
+
+impl CompilerKind {
+    /// Read the compiler's own version banner.
     ///
-    /// Rust spells the Apple triples `aarch64-apple-darwin`, which clang
-    /// accepts but reads as "whatever Darwin the host is". Naming the platform
-    /// and its minimum version explicitly is what makes the build reproducible
-    /// across machines.
-    fn clang_triple(&self) -> String {
-        let arch = match self.arch.as_str() {
-            "aarch64" => "arm64",
-            other => other,
+    /// Apple Clang identifies itself as `Apple clang version 17.0.0 (...)`,
+    /// upstream as `clang version 22.1.2 (https://github.com/llvm/...)`. There
+    /// is no flag that distinguishes them, so the banner is what we have.
+    fn detect(path: &Path) -> Self {
+        let Ok(output) = Command::new(path).arg("--version").output() else {
+            return Self::Other;
         };
 
-        if self.os == "macos" {
-            let min = env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| {
-                // Apple silicon has never shipped anything older than Big Sur.
-                match arch {
-                    "arm64" => "11.0".to_string(),
-                    _ => "10.12".to_string(),
-                }
-            });
-            format!("{arch}-apple-macosx{min}")
+        let banner = String::from_utf8_lossy(&output.stdout).to_lowercase();
+
+        if banner.contains("apple clang") || banner.contains("apple llvm") {
+            Self::AppleClang
+        } else if banner.contains("clang version") {
+            Self::Clang
+        } else if banner.contains("free software foundation") || banner.contains("gcc") {
+            Self::Gnu
         } else {
-            self.triple.clone()
+            Self::Other
         }
     }
 
-    /// Apple's clang needs to be told where the SDK is when it is not the
-    /// Xcode-bundled one. `xcrun` is the supported way to ask.
-    fn sdk_path(&self) -> Option<String> {
-        if !self.is_apple {
-            return None;
-        }
-
-        let sdk = match self.os.as_str() {
-            "ios" => "iphoneos",
-            "tvos" => "appletvos",
-            "watchos" => "watchos",
-            "visionos" => "xros",
-            _ => "macosx",
-        };
-
-        let out = Command::new("xcrun")
-            .args(["--sdk", sdk, "--show-sdk-path"])
-            .output()
-            .ok()?;
-
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .filter(|p| !p.is_empty())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Toolchain
-// ---------------------------------------------------------------------------
-
-/// The C++ compiler and archiver used for this build, plus the LLVM version
-/// behind them.
-struct Toolchain {
-    cxx: PathBuf,
-    ar: PathBuf,
-    /// LLVM major version of `cxx`, if it identified itself as clang.
-    clang_llvm_major: Option<u32>,
-    /// LLVM major version `rustc` reports for itself.
-    rustc_llvm_major: Option<u32>,
-}
-
-impl Toolchain {
-    /// Resolve the toolchain, preferring the most specific instruction available.
-    ///
-    /// Search order:
-    /// 1. `HARFBUZZ_SYS_LLVM_TOOLCHAIN` — an explicit LLVM install root.
-    /// 2. `$HOME/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64` — the
-    ///    canonical pinned toolchain for this project.
-    /// 3. `CXX` / `AR` — the conventional cross-compilation escape hatch.
-    /// 4. `clang++` and `llvm-ar` from `PATH`, then `c++` and `ar`.
-    ///
-    /// Only case 1 and 2 reliably give bitcode a linker can read, so the
-    /// version check in [`LtoMode::resolve`] does the actual gating.
-    fn discover(target: &Target) -> Self {
-        let from_root = |root: &Path| -> Option<(PathBuf, PathBuf)> {
-            let bin = root.join("bin");
-            let cxx = bin.join("clang++");
-            let ar = bin.join("llvm-ar");
-            (cxx.is_file() && ar.is_file()).then_some((cxx, ar))
-        };
-
-        let explicit = env::var_os("HARFBUZZ_SYS_LLVM_TOOLCHAIN").map(PathBuf::from);
-        if let Some(root) = &explicit {
-            let found = from_root(root).unwrap_or_else(|| {
-                panic!(
-                    "HARFBUZZ_SYS_LLVM_TOOLCHAIN={} does not contain bin/clang++ and bin/llvm-ar",
-                    root.display()
-                )
-            });
-            return Self::probe_versions(found.0, found.1);
-        }
-
-        let canonical = env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(CANONICAL_TOOLCHAIN))
-            .and_then(|root| from_root(&root));
-        if let Some((cxx, ar)) = canonical {
-            return Self::probe_versions(cxx, ar);
-        }
-
-        // Fall back to whatever the environment offers. `_ = target` keeps the
-        // signature uniform; the fallback path is platform-agnostic.
-        let _ = target;
-        let cxx = env::var_os("CXX")
-            .map(PathBuf::from)
-            .or_else(|| which("clang++"))
-            .or_else(|| which("c++"))
-            .expect("no C++ compiler found: set CXX or HARFBUZZ_SYS_LLVM_TOOLCHAIN");
-        let ar = env::var_os("AR")
-            .map(PathBuf::from)
-            .or_else(|| which("llvm-ar"))
-            .or_else(|| which("ar"))
-            .expect("no archiver found: set AR or HARFBUZZ_SYS_LLVM_TOOLCHAIN");
-
-        println!(
-            "cargo::warning=harfbuzz-sys: pinned LLVM toolchain not found, falling back to {}. \
-             Cross-language LTO will be disabled unless its LLVM matches rustc's.",
-            cxx.display()
-        );
-
-        Self::probe_versions(cxx, ar)
-    }
-
-    fn probe_versions(cxx: PathBuf, ar: PathBuf) -> Self {
-        Self {
-            clang_llvm_major: clang_major(&cxx),
-            rustc_llvm_major: rustc_llvm_major(),
-            cxx,
-            ar,
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Clang => "LLVM Clang",
+            Self::AppleClang => "Apple Clang",
+            Self::Gnu => "GCC",
+            Self::Other => "an unrecognised compiler",
         }
     }
 }
 
-/// Parse the major version out of `clang --version`, whose first line reads
-/// e.g. `clang version 22.1.2 (https://github.com/llvm/llvm-project ...)`.
-fn clang_major(cxx: &Path) -> Option<u32> {
-    let out = Command::new(cxx).arg("--version").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let after = text.split("clang version ").nth(1)?;
-    after.split(['.', '-', ' ']).next()?.parse().ok()
+/// Decide whether to compile HarfBuzz to LLVM bitcode.
+///
+/// Cross-language LTO is driven from the consumer's side: `-Clinker-plugin-lto`
+/// is what makes `rustc` emit bitcode rather than machine code, and only then
+/// does it help for the C++ half to be bitcode too. Without that flag, emitting
+/// bitcode here would hand the consumer's linker something it was not set up to
+/// read.
+fn lto_flag(kind: CompilerKind) -> Option<&'static str> {
+    if !consumer_wants_cross_language_lto() {
+        return None;
+    }
+
+    if kind == CompilerKind::Clang {
+        return Some("-flto");
+    }
+
+    println!(
+        "cargo::warning=harfbuzz-sys: -Clinker-plugin-lto is set, but the C++ compiler is {}. \
+         Cross-language LTO needs the same LLVM that rustc embeds, so HarfBuzz is being compiled \
+         without -flto. Set CXX to an LLVM clang++ whose version matches `rustc -vV`.",
+        kind.describe()
+    );
+
+    None
 }
 
-/// Ask the `rustc` Cargo is driving which LLVM it embeds. `rustc -vV` prints a
-/// `LLVM version: 22.1.2` line.
-fn rustc_llvm_major() -> Option<u32> {
-    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-    let out = Command::new(rustc).arg("-vV").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().find(|l| l.starts_with("LLVM version:"))?;
-    line.trim_start_matches("LLVM version:")
-        .trim()
-        .split('.')
-        .next()?
-        .parse()
-        .ok()
+/// Look for `-Clinker-plugin-lto` in the flags Cargo is passing to `rustc`.
+///
+/// `CARGO_ENCODED_RUSTFLAGS` is the authoritative form — it is `\x1f`-separated
+/// so that flags containing spaces survive intact. `RUSTFLAGS` is checked as a
+/// fallback for the rare setup that sets it without Cargo re-encoding it.
+fn consumer_wants_cross_language_lto() -> bool {
+    let encoded = env::var("CARGO_ENCODED_RUSTFLAGS")
+        .map(|flags| flags.split('\u{1f}').any(mentions_linker_plugin_lto))
+        .unwrap_or(false);
+
+    encoded
+        || env::var("RUSTFLAGS")
+            .map(|flags| flags.split_whitespace().any(mentions_linker_plugin_lto))
+            .unwrap_or(false)
 }
 
-/// Minimal `which`, so the build script keeps its zero-dependency promise.
+/// Match every spelling `rustc` accepts: `-Clinker-plugin-lto`,
+/// `-C linker-plugin-lto` (which arrives as two separate encoded flags),
+/// `-Clinker-plugin-lto=yes`, and `--codegen linker-plugin-lto`.
+///
+/// A bare `linker-plugin-lto` is matched too, because that is what the value
+/// half of a split `-C linker-plugin-lto` looks like.
+fn mentions_linker_plugin_lto(flag: &str) -> bool {
+    flag.trim_start_matches(['-', 'C'])
+        .trim_start_matches("-codegen")
+        .trim_start()
+        .starts_with("linker-plugin-lto")
+}
+
+/// Find the LLVM archiver that belongs to the compiler we are using.
+///
+/// Respecting `AR` first matters for cross-compilation setups that already
+/// point at the right tool; `cc` reads it too, so returning `None` there leaves
+/// `cc` in charge.
+fn find_llvm_ar(compiler: &Path) -> Option<PathBuf> {
+    if env::var_os("AR").is_some() {
+        return None;
+    }
+
+    compiler
+        .parent()
+        .map(|bin| bin.join("llvm-ar"))
+        .filter(|ar| ar.is_file())
+        .or_else(|| which("llvm-ar"))
+}
+
+/// Minimal `which`, so the build script keeps its dependency list to `cc`.
 fn which(program: &str) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|paths| {
         env::split_paths(&paths)
@@ -325,76 +414,10 @@ fn which(program: &str) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// LTO
-// ---------------------------------------------------------------------------
-
-enum LtoMode {
-    Thin,
-    Full,
-    Off,
-}
-
-impl LtoMode {
-    /// Decide whether it is *safe* to emit bitcode.
-    ///
-    /// Bitcode is only readable by an LLVM at least as new as the one that
-    /// produced it, and the linker — not this build script — is what has to
-    /// read it. Matching clang's major version to `rustc`'s is the closest
-    /// proxy we have: when they agree, the toolchain that can link the result
-    /// is the one already in use.
-    fn resolve(toolchain: &Toolchain) -> Self {
-        let requested = env::var("HARFBUZZ_SYS_LTO").unwrap_or_else(|_| "thin".to_string());
-
-        let requested = match requested.as_str() {
-            "off" | "no" | "false" => return Self::Off,
-            "full" | "fat" => Self::Full,
-            "thin" | "" => Self::Thin,
-            other => panic!("HARFBUZZ_SYS_LTO must be thin, full, or off (got {other:?})"),
-        };
-
-        match (toolchain.clang_llvm_major, toolchain.rustc_llvm_major) {
-            (Some(clang), Some(rustc)) if clang == rustc => requested,
-            (Some(clang), Some(rustc)) => {
-                println!(
-                    "cargo::warning=harfbuzz-sys: disabling LTO because clang's LLVM ({clang}) \
-                     differs from rustc's ({rustc}); bitcode produced by one would not be \
-                     readable by the other's linker."
-                );
-                Self::Off
-            }
-            _ => {
-                println!(
-                    "cargo::warning=harfbuzz-sys: disabling LTO because the compiler's LLVM \
-                     version could not be determined."
-                );
-                Self::Off
-            }
-        }
-    }
-
-    fn flag(&self) -> Option<&'static str> {
-        match self {
-            Self::Thin => Some("-flto=thin"),
-            Self::Full => Some("-flto"),
-            Self::Off => None,
-        }
-    }
-
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Thin => "thin",
-            Self::Full => "full",
-            Self::Off => "off",
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Features
 // ---------------------------------------------------------------------------
 
-/// The enabled Cargo features, resolved against what the target can actually
-/// provide.
+/// The enabled Cargo features, resolved against what the target can provide.
 struct Features {
     subset: bool,
     raster: bool,
@@ -408,24 +431,25 @@ struct Features {
     png: Option<PkgConfig>,
     zlib: Option<PkgConfig>,
     experimental: bool,
+    debug: bool,
     mini: bool,
     lean: bool,
     tiny: bool,
 }
 
 impl Features {
-    fn from_env(target: &Target) -> Self {
+    fn from_env() -> Self {
         let on = |name: &str| env::var_os(format!("CARGO_FEATURE_{name}")).is_some();
+        let is_apple = env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple");
 
-        // CoreText only exists on Apple platforms. Silently ignoring the
-        // feature elsewhere is friendlier than failing, because Cargo features
-        // are additive: an unrelated crate in the graph may have turned it on.
-        let coretext = on("CORETEXT") && target.is_apple;
+        // CoreText only exists on Apple platforms. Ignoring the feature
+        // elsewhere is friendlier than failing, because Cargo features are
+        // additive: an unrelated crate in the graph may have turned it on.
+        let coretext = on("CORETEXT") && is_apple;
         if on("CORETEXT") && !coretext {
             println!(
                 "cargo::warning=harfbuzz-sys: ignoring the `coretext` feature on a non-Apple \
-                 target ({})",
-                target.triple
+                 target"
             );
         }
 
@@ -442,6 +466,7 @@ impl Features {
             png: PkgConfig::require(on("PNG"), "libpng"),
             zlib: PkgConfig::require(on("ZLIB"), "zlib"),
             experimental: on("EXPERIMENTAL"),
+            debug: on("DEBUG"),
             mini: on("MINI"),
             lean: on("LEAN"),
             tiny: on("TINY"),
@@ -585,15 +610,20 @@ const FUNCTION_PROBES: &[(&str, &str, &str)] = &[
 ];
 
 impl Probe {
-    /// Run every probe, in parallel. Each one is a sub-second compile, but
-    /// there are fifteen of them and they are completely independent.
-    fn run_all(toolchain: &Toolchain, target: &Target) -> Vec<Self> {
-        let scratch = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("probes");
+    /// Run every probe, in parallel. Each is a sub-second compile, but there
+    /// are fifteen of them and they are completely independent.
+    fn run_all(compiler: &cc::Tool, out_dir: &Path) -> Vec<Self> {
+        let scratch = out_dir.join("probes");
         fs::create_dir_all(&scratch).expect("create probe directory");
 
         let jobs: Vec<(&'static str, String)> = HEADER_PROBES
             .iter()
-            .map(|(macro_name, header)| (*macro_name, format!("#include <{header}>\nint main(void){{return 0;}}\n")))
+            .map(|(macro_name, header)| {
+                (
+                    *macro_name,
+                    format!("#include <{header}>\nint main(void){{return 0;}}\n"),
+                )
+            })
             .chain(FUNCTION_PROBES.iter().map(|(macro_name, func, prefix)| {
                 // Taking the function's address forces the compiler to resolve
                 // a real declaration, which a bare call could satisfy with an
@@ -612,7 +642,7 @@ impl Probe {
                     let scratch = &scratch;
                     scope.spawn(move || Self {
                         macro_name: *macro_name,
-                        available: compiles(toolchain, target, scratch, macro_name, source),
+                        available: compiles(compiler, scratch, macro_name, source),
                     })
                 })
                 .collect();
@@ -626,25 +656,19 @@ impl Probe {
 }
 
 /// Compile `source` to an object file and report whether it succeeded.
-fn compiles(
-    toolchain: &Toolchain,
-    target: &Target,
-    scratch: &Path,
-    name: &str,
-    source: &str,
-) -> bool {
+///
+/// The command comes from `cc`, so it already carries the target triple, the
+/// sysroot, and anything the user put in `CXXFLAGS` — the probe therefore sees
+/// the same world the real compile will.
+fn compiles(compiler: &cc::Tool, scratch: &Path, name: &str, source: &str) -> bool {
     let file = scratch.join(format!("{name}.c"));
     let object = scratch.join(format!("{name}.o"));
     if fs::write(&file, source).is_err() {
         return false;
     }
 
-    let mut cmd = Command::new(&toolchain.cxx);
-    cmd.arg("-x").arg("c").arg("-c").arg("-w");
-    cmd.arg(format!("--target={}", target.clang_triple()));
-    if let Some(sdk) = target.sdk_path() {
-        cmd.arg("-isysroot").arg(sdk);
-    }
+    let mut cmd = compiler.to_command();
+    cmd.args(["-x", "c", "-c", "-w"]);
     cmd.arg(&file).arg("-o").arg(&object);
 
     cmd.output().map(|o| o.status.success()).unwrap_or(false)
@@ -671,17 +695,19 @@ fn render_config_h(probes: &[Probe], features: &Features) -> String {
 
     // HarfBuzz's atomics and locks compile to no-ops without this. Every
     // target this crate supports has pthreads; Windows uses its own path.
-    if cfg!(not(windows)) {
+    if env::var("CARGO_CFG_TARGET_FAMILY").as_deref() != Ok("windows") {
         out.push_str("\n#define HAVE_PTHREAD 1\n");
     }
 
     out.push('\n');
 
     // Libraries whose presence the amalgamation does *not* infer from
-    // `HB_HAS_*`. Note `HAVE_GRAPHITE2`: `harfbuzz-world.cc` translates
-    // `HB_HAS_GRAPHITE` into `HAVE_GRAPHITE`, but every consumer in the
-    // sources tests `HAVE_GRAPHITE2`, so setting it here is what actually
-    // enables the shaper.
+    // `HB_HAS_*`. Two of these paper over upstream bugs in
+    // `harfbuzz-world.cc`: it translates `HB_HAS_GRAPHITE` into
+    // `HAVE_GRAPHITE`, but every consumer in the sources tests
+    // `HAVE_GRAPHITE2`; and it never translates `HB_HAS_ICU` at all. Without
+    // these two defines the sources compile to empty translation units that
+    // link fine and do nothing.
     for (enabled, macro_name) in [
         (features.icu.is_some(), "HAVE_ICU"),
         (features.png.is_some(), "HAVE_PNG"),
@@ -702,152 +728,16 @@ fn render_config_h(probes: &[Probe], features: &Features) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Compile and archive
-// ---------------------------------------------------------------------------
-
-/// Compile the amalgamation into a single object file.
-fn compile(
-    toolchain: &Toolchain,
-    target: &Target,
-    features: &Features,
-    lto: &LtoMode,
-    hb_src: &Path,
-    out_dir: &Path,
-) -> PathBuf {
-    let object = out_dir.join("harfbuzz.o");
-    let mut cmd = Command::new(&toolchain.cxx);
-
-    cmd.arg("-c");
-    cmd.arg(format!("--target={}", target.clang_triple()));
-    if let Some(sdk) = target.sdk_path() {
-        cmd.arg("-isysroot").arg(sdk);
-    }
-
-    // Language settings, matched to upstream's meson defaults. ICU 75 and
-    // later require C++17 in its public headers, which meson also special-cases.
-    let needs_cxx17 = features.icu.as_ref().and_then(PkgConfig::major).is_some_and(|v| v >= 75);
-    cmd.arg(if needs_cxx17 { "-std=c++17" } else { "-std=c++11" });
-    cmd.args(["-fno-exceptions", "-fno-threadsafe-statics"]);
-    // Upstream builds without RTTI, but ICU's headers use it. Keeping RTTI on
-    // only when ICU is linked mirrors the note in upstream's meson.build.
-    if features.icu.is_none() {
-        cmd.arg("-fno-rtti");
-    }
-    cmd.arg("-fvisibility-inlines-hidden");
-
-    // Size first, as requested. `-ffunction-sections`/`-fdata-sections` put
-    // every function and object in its own section so the linker can drop the
-    // ones nothing references — see `emit_link_directives` for the other half.
-    cmd.args(["-Oz", "-ffunction-sections", "-fdata-sections"]);
-
-    // Debug info is kept on purpose: it is what makes the C++ side legible to
-    // lldb and to sampling profilers. It costs archive size, not runtime.
-    if env::var_os("HARFBUZZ_SYS_NO_DEBUG_INFO").is_none() {
-        cmd.arg("-g");
-        // Frame pointers make stacks walkable by instrumentation that does not
-        // parse DWARF. On arm64 the ABI mandates them anyway; stating it keeps
-        // other targets consistent.
-        cmd.arg("-fno-omit-frame-pointer");
-    }
-
-    if let Some(flag) = lto.flag() {
-        cmd.arg(flag);
-    }
-
-    cmd.arg("-DHAVE_CONFIG_H");
-    cmd.arg(format!("-I{}", out_dir.display()));
-    cmd.arg(format!("-I{}", hb_src.display()));
-
-    // The `HB_HAS_*` switches the amalgamation dispatches on. These have to be
-    // on the command line: `harfbuzz-world.cc` tests them before it includes
-    // anything, so `config.h` would be too late.
-    for (enabled, macro_name) in [
-        (features.subset, "HB_HAS_SUBSET"),
-        (features.raster, "HB_HAS_RASTER"),
-        (features.vector, "HB_HAS_VECTOR"),
-        (features.gpu, "HB_HAS_GPU"),
-        (features.coretext, "HB_HAS_CORETEXT"),
-        (features.freetype.is_some(), "HB_HAS_FREETYPE"),
-        (features.graphite2.is_some(), "HB_HAS_GRAPHITE"),
-        (features.icu.is_some(), "HB_HAS_ICU"),
-        (features.glib.is_some(), "HB_HAS_GLIB"),
-    ] {
-        if enabled {
-            cmd.arg(format!("-D{macro_name}=1"));
-        }
-    }
-
-    // Size profiles from upstream's CONFIG.md.
-    for (enabled, macro_name) in [
-        (features.tiny, "HB_TINY"),
-        (features.lean, "HB_LEAN"),
-        (features.mini, "HB_MINI"),
-    ] {
-        if enabled {
-            cmd.arg(format!("-D{macro_name}=1"));
-        }
-    }
-
-    for pkg in features.pkg_configs() {
-        cmd.args(&pkg.cflags);
-    }
-
-    cmd.arg(hb_src.join("harfbuzz-world.cc"));
-    cmd.arg("-o").arg(&object);
-
-    run(cmd, "compiling HarfBuzz");
-    object
-}
-
-/// Wrap the object in a static archive.
-///
-/// `llvm-ar` rather than the system `ar` is not optional when LTO is on: a
-/// bitcode member has no Mach-O symbol table, and only an LLVM-aware archiver
-/// can index it. A plain `ar` produces an archive the linker treats as empty.
-fn archive(toolchain: &Toolchain, object: &Path, out_dir: &Path) -> PathBuf {
-    let archive = out_dir.join("libharfbuzz.a");
-    // `ar` appends to an existing archive, which would accumulate stale members
-    // across rebuilds.
-    let _ = fs::remove_file(&archive);
-
-    let mut cmd = Command::new(&toolchain.ar);
-    cmd.arg("crs").arg(&archive).arg(object);
-    run(cmd, "archiving HarfBuzz");
-
-    archive
-}
-
-fn run(mut cmd: Command, what: &str) {
-    let rendered = format!("{cmd:?}");
-    match cmd.status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => panic!("{what} failed ({status})\ncommand: {rendered}"),
-        Err(err) => panic!("{what} could not start: {err}\ncommand: {rendered}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Cargo output
 // ---------------------------------------------------------------------------
 
-fn emit_link_directives(target: &Target, features: &Features, archive: &Path, out_dir: &Path) {
-    let _ = archive;
-    println!("cargo::rustc-link-search=native={}", out_dir.display());
-    println!("cargo::rustc-link-lib=static=harfbuzz");
-
-    // HarfBuzz is C++, so the standard library has to come along. libc++ is the
-    // only option on Apple platforms; elsewhere clang defaults to libstdc++ on
-    // GNU hosts.
-    if target.is_apple {
-        println!("cargo::rustc-link-lib=dylib=c++");
-    } else if target.os == "linux" || target.os == "android" {
-        println!("cargo::rustc-link-lib=dylib=stdc++");
-    }
-
+/// Link directives `cc` does not emit for us: system frameworks and the
+/// libraries `pkg-config` reported.
+fn emit_extra_link_directives(features: &Features) {
     if features.coretext {
         // ApplicationServices umbrella-links CoreText, CoreGraphics, and
         // CoreFoundation on macOS. iOS-family targets expose them separately.
-        if target.os == "macos" {
+        if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
             println!("cargo::rustc-link-lib=framework=ApplicationServices");
         } else {
             for framework in ["CoreText", "CoreGraphics", "CoreFoundation"] {
@@ -859,8 +749,8 @@ fn emit_link_directives(target: &Target, features: &Features, archive: &Path, ou
     for pkg in features.pkg_configs() {
         if pkg.libs.is_empty() {
             println!(
-                "cargo::warning=harfbuzz-sys: `pkg-config --libs {}` returned nothing; the \
-                 link step will probably report undefined symbols.",
+                "cargo::warning=harfbuzz-sys: `pkg-config --libs {}` returned nothing; the link \
+                 step will probably report undefined symbols.",
                 pkg.name
             );
         }
@@ -878,70 +768,32 @@ fn emit_link_directives(target: &Target, features: &Features, archive: &Path, ou
             }
         }
     }
-
-    // Complete the size story started by `-ffunction-sections`: tell the linker
-    // to drop sections nothing reaches. Mach-O spells this `-dead_strip`; ELF
-    // linkers spell it `--gc-sections`.
-    //
-    // These apply to this crate's own binaries and tests. A downstream binary
-    // needs the same flag in its own configuration to benefit.
-    if target.is_apple {
-        println!("cargo::rustc-link-arg=-Wl,-dead_strip");
-    } else {
-        println!("cargo::rustc-link-arg=-Wl,--gc-sections");
-    }
 }
 
-/// Point this crate's own binaries and tests at a linker that can read the
-/// bitcode we just produced.
-///
-/// With LTO on, `libharfbuzz.a` holds LLVM bitcode. `rustc` links through the
-/// platform C compiler, which on macOS drives Apple's `ld64` and its bundled,
-/// older libLTO — that combination cannot parse the archive at all. Selecting
-/// the `lld` that shipped alongside our `clang++` keeps the producer and the
-/// consumer of the bitcode on the same LLVM.
-///
-/// Only this package's own artifacts are covered. Cargo does not propagate link
-/// arguments to dependents, so a downstream binary has to make the same choice
-/// in its own `.cargo/config.toml`; the repository root has a worked example.
-fn emit_lto_linker_directives(toolchain: &Toolchain, lto: &LtoMode) {
-    if matches!(lto, LtoMode::Off) {
-        return;
-    }
-
-    let Some(root) = toolchain.cxx.parent().and_then(Path::parent) else {
-        return;
-    };
-
-    // Apple's linker loads LTO support from a dylib, and `-lto_library` is the
-    // supported way to choose which one. Swapping in the matching libLTO is
-    // less invasive than replacing `ld64` outright, and keeps every Apple
-    // linker feature working.
-    let lto_library = root.join("lib").join("libLTO.dylib");
-    if !lto_library.is_file() {
-        println!(
-            "cargo::warning=harfbuzz-sys: LTO is on but {} is missing. Linking may fail with \
-             \"could not parse bitcode object file\"; set HARFBUZZ_SYS_LTO=off to opt out.",
-            lto_library.display()
-        );
-        return;
-    }
-
+/// Hand `tests/symbols.rs` what it needs to check every declared binding
+/// against the symbols the archive actually defines.
+fn emit_test_env(out_dir: &Path, compiler: &Path) {
     println!(
-        "cargo::rustc-link-arg=-Wl,-lto_library,{}",
-        lto_library.display()
+        "cargo::rustc-env=HARFBUZZ_SYS_ARCHIVE={}",
+        out_dir.join("libharfbuzz.a").display()
     );
+
+    // With LTO on, the archive members are bitcode and only an LLVM-aware
+    // reader can list their symbols.
+    let nm = compiler
+        .parent()
+        .map(|bin| bin.join("llvm-nm"))
+        .filter(|nm| nm.is_file())
+        .or_else(|| which("llvm-nm"))
+        .unwrap_or_else(|| PathBuf::from("nm"));
+    println!("cargo::rustc-env=HARFBUZZ_SYS_NM={}", nm.display());
 }
 
 /// Publish what we did to dependent build scripts.
 ///
 /// Because this package declares `links = "harfbuzz"`, Cargo forwards each of
 /// these to dependents as `DEP_HARFBUZZ_<KEY>`.
-fn emit_metadata(hb_root: &Path, lto: &LtoMode, toolchain: &Toolchain) {
-    println!("cargo::metadata=include={}", hb_root.join("src").display());
-    println!("cargo::metadata=lto={}", lto.as_str());
-    println!("cargo::metadata=cxx={}", toolchain.cxx.display());
-    if let Some(major) = toolchain.clang_llvm_major {
-        println!("cargo::metadata=llvm_major={major}");
-    }
+fn emit_metadata(hb_src: &Path, kind: CompilerKind) {
+    println!("cargo::metadata=include={}", hb_src.display());
+    println!("cargo::metadata=compiler={:?}", kind);
 }

@@ -1,25 +1,31 @@
-# Cross-language LTO configuration for this workspace.
+# Toolchain for this workspace.
 #
-# `harfbuzz-sys/build.rs` compiles HarfBuzz to LLVM bitcode so the C++ and Rust
-# halves can be optimized together at link time. Bitcode is only readable by an
-# LLVM at least as new as the one that produced it, and Apple's `ld64` bundles
-# its own older libLTO, so a stock link fails with:
+# HarfBuzz is C++, so `harfbuzz-sys/build.rs` drives `cc::Build::cpp(true)`,
+# which reads CXX rather than CC. CC is set alongside it for anything that
+# compiles C.
 #
-#     ld: could not parse bitcode object file ...: 'Unknown attribute kind ...'
-#
-# `-lto_library` is Darwin's supported way to hand `ld64` a different libLTO.
-# Pointing it at the same LLVM that compiled HarfBuzz keeps the producer and
-# the consumer of the bitcode in step, without replacing the system linker.
-#
-# Relocating the toolchain: change the path below, and set
-# `HARFBUZZ_SYS_LLVM_TOOLCHAIN` to the same install root so the build script
-# uses it too. To opt out entirely, delete this file and build with
-# `HARFBUZZ_SYS_LTO=off`.
+# Pointing both at an upstream LLVM install — rather than the Xcode one — is
+# what makes cross-language LTO available: bitcode can only be read by an LLVM
+# at least as new as the one that produced it, and `rustc` embeds its own. Keep
+# this in step with `rustc -vV`'s "LLVM version" line.
 
-[target.aarch64-apple-darwin]
-rustflags = [
-  "-Clink-arg=-Wl,-lto_library,/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/lib/libLTO.dylib",
-  # Completes the -ffunction-sections / -fdata-sections story from build.rs by
-  # letting the linker drop everything nothing references.
-  "-Clink-arg=-Wl,-dead_strip",
-]
+[env]
+CC = "/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/clang"
+CXX = "/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/clang++"
+
+# Cross-language LTO is opt-in and is NOT enabled here.
+#
+# `-Clinker-plugin-lto` makes `rustc` emit LLVM bitcode instead of machine code;
+# `build.rs` watches for it in CARGO_ENCODED_RUSTFLAGS and adds `-flto` to the
+# HarfBuzz compile to match, so the two halves can be optimized together. It is
+# left off by default because it also requires a linker that can read that
+# bitcode — the system linker on macOS carries an older libLTO and will fail.
+#
+# To turn it on, uncomment the block below and make sure the linker comes from
+# the same LLVM as CXX above.
+#
+# [target.aarch64-apple-darwin]
+# rustflags = [
+#   "-Clinker-plugin-lto",
+#   "-Clink-arg=-fuse-ld=/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/ld64.lld",
+# ]

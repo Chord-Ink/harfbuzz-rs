@@ -13,8 +13,14 @@ rust-version.workspace = true
 # the parts the build script actually reads are packaged.
 exclude = ["harfbuzz/test", "harfbuzz/perf", "harfbuzz/docs", "harfbuzz/util"]
 
+[build-dependencies]
+# Compiler discovery, CC/CXX/CFLAGS/CXXFLAGS handling, target-triple and sysroot
+# translation, and archiver selection. HarfBuzz is C++, so the build uses
+# `cc::Build::cpp(true)`, which reads `CXX` rather than `CC`.
+cc = "1"
+
 [features]
-default = ["subset"]
+default = ["subset", "debug"]
 
 # --- HarfBuzz sub-libraries -------------------------------------------------
 # These map one-to-one onto upstream's `HB_HAS_*` build switches. Each adds
@@ -50,6 +56,13 @@ glib = []
 # back ends still build; they just cannot read PNG or emit compressed PDF.
 png = []
 zlib = []
+
+# --- Debug information ------------------------------------------------------
+# Compiles HarfBuzz with `-g` and keeps frame pointers, so the C++ side stays
+# legible to a debugger and to sampling profilers. On by default: the debug info
+# lands in the archive, not in a stripped release binary, and being able to see
+# into HarfBuzz is worth more than the intermediate artifact size.
+debug = []
 
 # --- Upstream-unstable API --------------------------------------------------
 # Turns on `HB_EXPERIMENTAL_API`. Upstream makes no compatibility promise for

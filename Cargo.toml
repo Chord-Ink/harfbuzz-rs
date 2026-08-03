@@ -21,7 +21,10 @@ rust-version.workspace = true
 harfbuzz-sys = { path = "harfbuzz-sys", version = "0.1.0", default-features = false }
 
 [features]
-default = ["subset"]
+default = ["subset", "debug"]
+
+# Build HarfBuzz with debug information and frame pointers.
+debug = ["harfbuzz-sys/debug"]
 
 # HarfBuzz optional sub-libraries. Each one turns on an additional slice of the
 # C library and the Rust module that wraps it.
