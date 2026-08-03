@@ -20,17 +20,25 @@ NM = "/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/llvm-n
 
 # Cross-language LTO is opt-in and is NOT enabled here.
 #
-# `-Clinker-plugin-lto` makes `rustc` emit LLVM bitcode instead of machine code;
+# `-Clinker-plugin-lto` makes `rustc` emit LLVM bitcode instead of machine code.
 # `build.rs` watches for it in CARGO_ENCODED_RUSTFLAGS and adds `-flto` to the
-# HarfBuzz compile to match, so the two halves can be optimized together. It is
-# left off by default because it also requires a linker that can read that
-# bitcode — the system linker on macOS carries an older libLTO and will fail.
+# HarfBuzz compile to match, so both halves reach the linker as bitcode and can
+# be optimized together. That half works today: with CXX set above, the archive
+# comes out as LLVM bitcode.
 #
-# To turn it on, uncomment the block below and make sure the linker comes from
-# the same LLVM as CXX above.
+# The LINK does not, on this target. `rustc` translates
+# `-Clinker-plugin-lto` into `-Wl,-plugin-opt=...`, which is GNU-linker syntax;
+# no Mach-O linker accepts it, and both Apple's `ld` and `ld64.lld` fail with
 #
-# [target.aarch64-apple-darwin]
-# rustflags = [
-#   "-Clinker-plugin-lto",
-#   "-Clink-arg=-fuse-ld=/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/ld64.lld",
-# ]
+#     ld: unknown options: -plugin-opt=O0 -plugin-opt=mcpu=apple-m1
+#
+# So cross-language LTO is reachable on ELF targets but blocked on
+# aarch64-apple-darwin by rustc itself, not by anything in this crate. Nothing
+# here needs to change if that is fixed upstream.
+#
+# One further trap when you do enable it: `rustflags` also applies to build
+# scripts, whose host binary hits the same failure. Passing `--target` explicitly
+# keeps build scripts out of the target's flags.
+#
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-Clinker-plugin-lto", "-Clink-arg=-fuse-ld=lld"]
