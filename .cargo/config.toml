@@ -12,6 +12,11 @@
 [env]
 CC = "/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/clang"
 CXX = "/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/clang++"
+# AR and NM must come from the same toolchain: under -Clinker-plugin-lto the
+# object files are LLVM bitcode, which a plain ar cannot index and a plain nm
+# cannot read.
+AR = "/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/llvm-ar"
+NM = "/Users/ares/Developer/SDK/llvm/toolchains/22.1.2/darwin-aarch64/bin/llvm-nm"
 
 # Cross-language LTO is opt-in and is NOT enabled here.
 #

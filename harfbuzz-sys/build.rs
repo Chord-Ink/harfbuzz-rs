@@ -87,16 +87,15 @@ fn main() {
 
     if let Some(flag) = lto_flag(kind) {
         build.flag(flag);
-        // With `-flto` the object file is LLVM bitcode, which has no native
-        // symbol table. Only an LLVM-aware archiver can index it; a plain `ar`
-        // yields an archive the linker reads as empty.
-        if let Some(llvm_ar) = find_llvm_ar(compiler.path()) {
-            build.archiver(llvm_ar);
-        } else {
+
+        // With `-flto` the object file is LLVM bitcode, which carries no native
+        // symbol table. Only an LLVM-aware archiver can index it, and `cc`
+        // takes the archiver from `AR`, so that is where the choice belongs.
+        if env::var_os("AR").is_none() {
             println!(
-                "cargo::warning=harfbuzz-sys: emitting LLVM bitcode but could not find `llvm-ar`. \
-                 If the link reports undefined HarfBuzz symbols, set AR to your toolchain's \
-                 llvm-ar."
+                "cargo::warning=harfbuzz-sys: compiling to LLVM bitcode, but AR is unset. A \
+                 plain `ar` cannot index bitcode and produces an archive the linker reads as \
+                 empty. Set AR to the llvm-ar that ships with your CXX."
             );
         }
     }
@@ -111,7 +110,7 @@ fn main() {
     build.compile("harfbuzz");
 
     emit_extra_link_directives(&features);
-    emit_test_env(&out_dir, compiler.path());
+    emit_test_env(&out_dir);
     emit_metadata(&hb_src, kind);
 }
 
@@ -385,32 +384,6 @@ fn mentions_linker_plugin_lto(flag: &str) -> bool {
         .trim_start_matches("-codegen")
         .trim_start()
         .starts_with("linker-plugin-lto")
-}
-
-/// Find the LLVM archiver that belongs to the compiler we are using.
-///
-/// Respecting `AR` first matters for cross-compilation setups that already
-/// point at the right tool; `cc` reads it too, so returning `None` there leaves
-/// `cc` in charge.
-fn find_llvm_ar(compiler: &Path) -> Option<PathBuf> {
-    if env::var_os("AR").is_some() {
-        return None;
-    }
-
-    compiler
-        .parent()
-        .map(|bin| bin.join("llvm-ar"))
-        .filter(|ar| ar.is_file())
-        .or_else(|| which("llvm-ar"))
-}
-
-/// Minimal `which`, so the build script keeps its dependency list to `cc`.
-fn which(program: &str) -> Option<PathBuf> {
-    env::var_os("PATH").and_then(|paths| {
-        env::split_paths(&paths)
-            .map(|dir| dir.join(program))
-            .find(|candidate| candidate.is_file())
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -772,21 +745,20 @@ fn emit_extra_link_directives(features: &Features) {
 
 /// Hand `tests/symbols.rs` what it needs to check every declared binding
 /// against the symbols the archive actually defines.
-fn emit_test_env(out_dir: &Path, compiler: &Path) {
+///
+/// The reader defaults to `nm`, which is right for the ordinary build. Under
+/// `-Clinker-plugin-lto` the archive members are bitcode and need `llvm-nm`
+/// instead; `NM` selects it, the same way `AR` selects the archiver.
+fn emit_test_env(out_dir: &Path) {
     println!(
         "cargo::rustc-env=HARFBUZZ_SYS_ARCHIVE={}",
         out_dir.join("libharfbuzz.a").display()
     );
-
-    // With LTO on, the archive members are bitcode and only an LLVM-aware
-    // reader can list their symbols.
-    let nm = compiler
-        .parent()
-        .map(|bin| bin.join("llvm-nm"))
-        .filter(|nm| nm.is_file())
-        .or_else(|| which("llvm-nm"))
-        .unwrap_or_else(|| PathBuf::from("nm"));
-    println!("cargo::rustc-env=HARFBUZZ_SYS_NM={}", nm.display());
+    println!("cargo::rerun-if-env-changed=NM");
+    println!(
+        "cargo::rustc-env=HARFBUZZ_SYS_NM={}",
+        env::var("NM").unwrap_or_else(|_| "nm".to_string())
+    );
 }
 
 /// Publish what we did to dependent build scripts.
