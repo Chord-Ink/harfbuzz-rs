@@ -916,3 +916,340 @@ a singleton decomposition sets `*b` to `0`.
 **Notes** — Since HarfBuzz 0.9.2. Canonical decomposition only; the
 compatibility variant, `hb_unicode_decompose_compatibility()`, was deprecated in
 HarfBuzz 2.0.0 and lives in `hb-deprecated.h`.
+
+## Usage
+
+### Querying properties with the default implementation
+
+```c
+#include <hb.h>
+
+hb_unicode_funcs_t *ufuncs = hb_unicode_funcs_get_default ();  /* do not destroy */
+
+hb_unicode_general_category_t gc = hb_unicode_general_category (ufuncs, 0x0301);
+hb_unicode_combining_class_t  cc = hb_unicode_combining_class  (ufuncs, 0x0301);
+hb_script_t                   sc = hb_unicode_script           (ufuncs, 0x0915);
+hb_codepoint_t                mi = hb_unicode_mirroring        (ufuncs, '(');
+
+hb_codepoint_t ab;
+if (hb_unicode_compose (ufuncs, 0x0041, 0x0301, &ab))
+  { /* ab == 0x00C1, LATIN CAPITAL LETTER A WITH ACUTE */ }
+
+hb_codepoint_t a, b;
+if (hb_unicode_decompose (ufuncs, 0x00C1, &a, &b))
+  { /* a == 0x0041, b == 0x0301 */ }
+```
+
+```rust
+use harfbuzz_sys::{
+    HB_UNICODE_COMBINING_CLASS_ABOVE, hb_codepoint_t, hb_unicode_combining_class,
+    hb_unicode_compose, hb_unicode_decompose, hb_unicode_funcs_get_default, hb_unicode_script,
+};
+
+// SAFETY: `hb_unicode_funcs_get_default` returns a process-wide singleton that
+// is valid for the whole program and is not owned by us, so it is never
+// destroyed here. The out-parameters point at live locals.
+unsafe {
+    let ufuncs = hb_unicode_funcs_get_default();
+
+    let ccc = hb_unicode_combining_class(ufuncs, 0x0301);
+    assert_eq!(ccc, HB_UNICODE_COMBINING_CLASS_ABOVE);
+
+    let script = hb_unicode_script(ufuncs, 0x0915);
+    assert_eq!(script, harfbuzz_sys::HB_SCRIPT_DEVANAGARI);
+
+    let mut ab: hb_codepoint_t = 0;
+    if hb_unicode_compose(ufuncs, 0x0041, 0x0301, &mut ab) != 0 {
+        assert_eq!(ab, 0x00C1);
+    }
+
+    let (mut a, mut b): (hb_codepoint_t, hb_codepoint_t) = (0, 0);
+    if hb_unicode_decompose(ufuncs, 0x00C1, &mut a, &mut b) != 0 {
+        assert_eq!((a, b), (0x0041, 0x0301));
+    }
+}
+```
+
+### Overriding a single property
+
+The common case: keep the bundled tables for everything, but report a different
+script for a range of code points. Note that only the script callback is
+installed; the other five continue to come from the parent.
+
+```c
+#include <hb.h>
+
+static hb_script_t
+my_script (hb_unicode_funcs_t *ufuncs, hb_codepoint_t u, void *user_data)
+{
+  hb_unicode_funcs_t *parent = hb_unicode_funcs_get_parent (ufuncs);
+
+  /* Force our private-use range to be treated as Latin. */
+  if (u >= 0xE000 && u <= 0xE0FF)
+    return HB_SCRIPT_LATIN;
+
+  return hb_unicode_script (parent, u);
+}
+
+hb_unicode_funcs_t *ufuncs =
+  hb_unicode_funcs_create (hb_unicode_funcs_get_default ());
+
+hb_unicode_funcs_set_script_func (ufuncs, my_script, NULL, NULL);
+hb_unicode_funcs_make_immutable (ufuncs);
+
+hb_buffer_set_unicode_funcs (buf, ufuncs);
+hb_unicode_funcs_destroy (ufuncs);   /* the buffer took its own reference */
+```
+
+Calling `hb_unicode_script()` on the parent from inside the callback is the
+supported way to chain: `hb_unicode_funcs_get_parent()` returns a borrowed
+pointer, and the parent is guaranteed immutable and alive for as long as the
+child is. Do **not** call `hb_unicode_script(ufuncs, u)` — that is infinite
+recursion.
+
+### The same thing in Rust, with owned user data
+
+```rust
+use core::ffi::c_void;
+use harfbuzz_sys::{
+    HB_SCRIPT_LATIN, hb_codepoint_t, hb_destroy_func_t, hb_script_t, hb_unicode_funcs_create,
+    hb_unicode_funcs_destroy, hb_unicode_funcs_get_default, hb_unicode_funcs_get_parent,
+    hb_unicode_funcs_make_immutable, hb_unicode_funcs_set_script_func, hb_unicode_funcs_t,
+    hb_unicode_script,
+};
+
+struct Overrides {
+    start: hb_codepoint_t,
+    end: hb_codepoint_t,
+}
+
+unsafe extern "C" fn script_cb(
+    ufuncs: *mut hb_unicode_funcs_t,
+    unicode: hb_codepoint_t,
+    user_data: *mut c_void,
+) -> hb_script_t {
+    // SAFETY: `user_data` is the leaked Box installed below. HarfBuzz keeps it
+    // alive until the destroy notifier runs, which happens strictly after the
+    // last callback invocation.
+    let overrides = unsafe { &*(user_data as *const Overrides) };
+
+    if unicode >= overrides.start && unicode <= overrides.end {
+        return HB_SCRIPT_LATIN;
+    }
+
+    // SAFETY: the parent is borrowed from `ufuncs`, is immutable, and outlives
+    // it. Querying the parent (not `ufuncs`) is what avoids infinite recursion.
+    unsafe { hb_unicode_script(hb_unicode_funcs_get_parent(ufuncs), unicode) }
+}
+
+unsafe extern "C" fn drop_overrides(user_data: *mut c_void) {
+    // SAFETY: `user_data` came from `Box::into_raw` and is dropped exactly once.
+    drop(unsafe { Box::from_raw(user_data as *mut Overrides) });
+}
+
+fn make_ufuncs() -> *mut hb_unicode_funcs_t {
+    let overrides = Box::into_raw(Box::new(Overrides { start: 0xE000, end: 0xE0FF }));
+
+    // SAFETY: the default funcs are a valid singleton; `hb_unicode_funcs_create`
+    // takes its own reference on it. The setter takes ownership of the leaked
+    // Box unconditionally, so there is nothing to free on any path here.
+    unsafe {
+        let ufuncs = hb_unicode_funcs_create(hb_unicode_funcs_get_default());
+
+        hb_unicode_funcs_set_script_func(
+            ufuncs,
+            Some(script_cb),
+            overrides as *mut c_void,
+            Some(drop_overrides) as hb_destroy_func_t,
+        );
+        hb_unicode_funcs_make_immutable(ufuncs);
+
+        ufuncs
+    }
+}
+
+unsafe fn release(ufuncs: *mut hb_unicode_funcs_t) {
+    // SAFETY: releases the reference obtained from `hb_unicode_funcs_create`.
+    unsafe { hb_unicode_funcs_destroy(ufuncs) };
+}
+```
+
+### Detecting that a structure was frozen
+
+Because the setters return `void`, the only way to know whether an install took
+effect is to ask beforehand:
+
+```rust
+use harfbuzz_sys::{hb_unicode_funcs_is_immutable, hb_unicode_funcs_t};
+
+// SAFETY: `ufuncs` is a live structure the caller owns a reference to.
+unsafe fn can_still_install(ufuncs: *mut hb_unicode_funcs_t) -> bool {
+    unsafe { hb_unicode_funcs_is_immutable(ufuncs) == 0 }
+}
+```
+
+### Walking a combining sequence
+
+Combining class is what the shaper uses to decide mark ordering; the values are
+raw numbers, so a `match` needs a catch-all arm:
+
+```rust
+use harfbuzz_sys::{
+    HB_UNICODE_COMBINING_CLASS_ABOVE, HB_UNICODE_COMBINING_CLASS_BELOW,
+    HB_UNICODE_COMBINING_CLASS_NOT_REORDERED, HB_UNICODE_COMBINING_CLASS_VIRAMA,
+    hb_codepoint_t, hb_unicode_combining_class, hb_unicode_funcs_t,
+};
+
+unsafe fn describe(ufuncs: *mut hb_unicode_funcs_t, u: hb_codepoint_t) -> &'static str {
+    // SAFETY: `ufuncs` is a live structure; the query has no out-parameters.
+    match unsafe { hb_unicode_combining_class(ufuncs, u) } {
+        HB_UNICODE_COMBINING_CLASS_NOT_REORDERED => "base or spacing mark",
+        HB_UNICODE_COMBINING_CLASS_VIRAMA => "virama",
+        HB_UNICODE_COMBINING_CLASS_ABOVE => "mark above",
+        HB_UNICODE_COMBINING_CLASS_BELOW => "mark below",
+        // Required: newer Unicode versions add values with no constant here.
+        _ => "other combining class",
+    }
+}
+```
+
+## Pitfalls
+
+### The setters fail silently
+
+`hb_unicode_funcs_set_*_func()` returns `void`. If the structure is immutable
+the call does nothing except run your `destroy` notifier. Structures become
+immutable in three ways you might not expect: an explicit
+`hb_unicode_funcs_make_immutable()`, being passed as `parent` to
+`hb_unicode_funcs_create()`, and being the shared empty singleton (which is
+frozen from birth). Check with `hb_unicode_funcs_is_immutable()` if you cannot
+prove the state statically.
+
+### Never mutate the default structure
+
+`hb_unicode_funcs_get_default()` hands back a process-wide singleton. Installing
+a callback on it is at best a silent no-op and at worst a data race with every
+other user of the library in the process. Always
+`hb_unicode_funcs_create(hb_unicode_funcs_get_default())` and modify the child.
+
+### `hb_unicode_funcs_create` never returns null
+
+On allocation failure it returns the empty singleton — whose stubs report every
+character as an `Lo` letter in an unknown script with no composition. Shaping
+against that produces plausible-looking garbage rather than an error. If you
+need to detect failure, compare the result against `hb_unicode_funcs_get_empty()`.
+
+### Inheritance is a snapshot taken at creation time
+
+The child copies the parent's function table when it is created. Mutating the
+parent afterwards would not affect the child — but you cannot, because creating
+the child froze the parent. The practical consequence is ordering: install the
+parent's callbacks *before* creating children from it, never after.
+
+### `hb_unicode_funcs_get_parent` is a borrow
+
+It returns the child's own reference, not a new one. Destroying it without a
+matching `hb_unicode_funcs_reference()` is an over-release. It is also never
+null — a parentless structure reports the empty singleton — so a null check
+tells you nothing.
+
+### Passing a null `func` does not clear a method
+
+It restores the **parent's** implementation, and additionally installs the
+parent's `user_data` for that method with no destroy notifier. If you wanted the
+method disabled, create your structure with a null (hence empty) parent, or
+install an explicit stub.
+
+### The combining-class constants are not exhaustive
+
+The header says clients must handle any value in 0..=254. `HB_UNICODE_COMBINING_CLASS_INVALID`
+is 255 and is a HarfBuzz sentinel that is never a real UCD value. A Rust `match`
+without a catch-all arm will not compile against the integer alias — which is
+the point.
+
+### The general-category numbering is HarfBuzz's own
+
+`HB_UNICODE_GENERAL_CATEGORY_CONTROL` is 0, `HB_UNICODE_GENERAL_CATEGORY_FORMAT`
+is 1, and so on through 29. These do not line up with ICU's `UCharCategory`,
+GLib's `GUnicodeType`, or any UCD file's ordering. Transmuting between them
+compiles and silently produces wrong shaping. Write an explicit mapping table.
+
+### Mirroring's "no answer" is the identity
+
+`hb_unicode_mirroring()` returns the *input* code point when there is no
+mirrored form, not zero and not `HB_CODEPOINT_INVALID`. Code that tests
+`if (mirrored)` will treat every non-mirroring character as mirroring.
+
+### Out-parameters are untouched on failure
+
+`hb_unicode_compose()` and `hb_unicode_decompose()` leave `*ab` / `*a` / `*b`
+alone when they return false. Reading them without checking the return value
+reads uninitialised memory. In Rust, initialise the locals before taking `&mut`
+to them, as the examples above do.
+
+### Do not recurse into your own structure
+
+Inside a callback, `hb_unicode_script(ufuncs, u)` calls the callback again.
+Query `hb_unicode_funcs_get_parent(ufuncs)` instead.
+
+### Threading
+
+The header is silent on thread safety. Reference counts are atomic in a normally
+configured build, so `hb_unicode_funcs_reference()` and
+`hb_unicode_funcs_destroy()` are safe from multiple threads. The setters and the
+immutable flag are not documented as synchronised. The safe discipline is the
+usual one: build the structure on one thread, `hb_unicode_funcs_make_immutable()`
+it, then share it. Your own callbacks must also be re-entrant and thread-safe if
+the structure is shared, since HarfBuzz calls them from whichever thread is
+shaping.
+
+### `HB_UNICODE_MAX` is documentation, not enforcement
+
+Nothing in this header rejects a code point above `0x10FFFF`. Your callbacks
+will be handed whatever the buffer contains, so bounds-check your own tables.
+
+### Deprecated relatives
+
+`hb_unicode_eastasian_width()` and `hb_unicode_decompose_compatibility()`, plus
+their callback typedefs and setters, were deprecated in HarfBuzz 2.0.0 and moved
+to `hb-deprecated.h`. They are not part of the `hb-unicode` section and are not
+documented here.
+
+## Section coverage
+
+All 32 entries from upstream's `<FILE>hb-unicode</FILE>` section are covered:
+
+| Section entry | Covered under |
+| --- | --- |
+| `hb_unicode_general_category` | Querying properties |
+| `hb_unicode_combining_class` | Querying properties |
+| `hb_unicode_mirroring` | Querying properties |
+| `hb_unicode_script` | Querying properties |
+| `hb_unicode_compose` | Querying properties |
+| `hb_unicode_decompose` | Querying properties |
+| `hb_unicode_funcs_create` | Obtaining a structure |
+| `hb_unicode_funcs_get_empty` | Obtaining a structure |
+| `hb_unicode_funcs_reference` | Reference counting |
+| `hb_unicode_funcs_destroy` | Reference counting |
+| `hb_unicode_funcs_set_user_data` | User data |
+| `hb_unicode_funcs_get_user_data` | User data |
+| `hb_unicode_funcs_make_immutable` | Immutability |
+| `hb_unicode_funcs_is_immutable` | Immutability |
+| `hb_unicode_funcs_get_default` | Obtaining a structure |
+| `hb_unicode_funcs_get_parent` | Inheritance |
+| `hb_unicode_general_category_func_t` | Types → Callback typedefs |
+| `hb_unicode_funcs_set_general_category_func` | Installing callbacks |
+| `hb_unicode_combining_class_func_t` | Types → Callback typedefs |
+| `hb_unicode_funcs_set_combining_class_func` | Installing callbacks |
+| `hb_unicode_mirroring_func_t` | Types → Callback typedefs |
+| `hb_unicode_funcs_set_mirroring_func` | Installing callbacks |
+| `hb_unicode_script_func_t` | Types → Callback typedefs |
+| `hb_unicode_funcs_set_script_func` | Installing callbacks |
+| `hb_unicode_compose_func_t` | Types → Callback typedefs |
+| `hb_unicode_funcs_set_compose_func` | Installing callbacks |
+| `hb_unicode_decompose_func_t` | Types → Callback typedefs |
+| `hb_unicode_funcs_set_decompose_func` | Installing callbacks |
+| `HB_UNICODE_MAX` | Types |
+| `hb_unicode_combining_class_t` | Types |
+| `hb_unicode_general_category_t` | Types |
+| `hb_unicode_funcs_t` | Types |

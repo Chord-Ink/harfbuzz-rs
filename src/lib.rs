@@ -101,6 +101,9 @@ mod script;
 mod shape;
 mod tag;
 
+#[cfg(feature = "subset")]
+pub mod subset;
+
 #[cfg(test)]
 mod testing;
 

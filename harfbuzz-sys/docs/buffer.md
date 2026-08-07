@@ -2301,3 +2301,393 @@ skip lookups).
 
 **Notes** — since HarfBuzz 13.0.0. Does nothing when called from outside a
 message callback, so it is safe but useless elsewhere.
+
+## Usage
+
+### Shaping a string, in C
+
+```c
+#include <hb.h>
+
+void shape_once (hb_font_t *font, const char *utf8)
+{
+  hb_buffer_t *buf = hb_buffer_create ();
+
+  hb_buffer_add_utf8 (buf, utf8, -1, 0, -1);
+  hb_buffer_guess_segment_properties (buf);   /* or set the three by hand */
+
+  hb_shape (font, buf, NULL, 0);
+
+  if (!hb_buffer_allocation_successful (buf)) {
+    hb_buffer_destroy (buf);
+    return;                                    /* out of memory */
+  }
+
+  unsigned int len;
+  hb_glyph_info_t     *info = hb_buffer_get_glyph_infos (buf, &len);
+  hb_glyph_position_t *pos  = hb_buffer_get_glyph_positions (buf, &len);
+
+  int x = 0, y = 0;
+  for (unsigned int i = 0; i < len; i++) {
+    draw_glyph (font, info[i].codepoint, x + pos[i].x_offset, y + pos[i].y_offset);
+    x += pos[i].x_advance;
+    y += pos[i].y_advance;
+  }
+
+  hb_buffer_destroy (buf);
+}
+```
+
+### Shaping a string, in Rust
+
+```rust
+use core::ffi::{c_char, c_uint};
+use harfbuzz_sys::{
+    hb_buffer_add_utf8, hb_buffer_allocation_successful, hb_buffer_create, hb_buffer_destroy,
+    hb_buffer_get_glyph_infos, hb_buffer_get_glyph_positions,
+    hb_buffer_guess_segment_properties, hb_font_t, hb_glyph_info_t, hb_glyph_position_t, hb_shape,
+};
+
+/// Shape `text` with `font` and return one (glyph id, cluster, x_advance) per glyph.
+///
+/// # Safety
+/// `font` must be a live `hb_font_t`.
+unsafe fn shape(font: *mut hb_font_t, text: &str) -> Option<alloc::vec::Vec<(u32, u32, i32)>> {
+    // SAFETY: `hb_buffer_create` takes no arguments and never returns null.
+    let buf = unsafe { hb_buffer_create() };
+
+    // SAFETY: `buf` is live; `text` is valid UTF-8 of the given byte length, and
+    // -1 for `item_length` means "to the end".
+    unsafe {
+        hb_buffer_add_utf8(
+            buf,
+            text.as_ptr() as *const c_char,
+            text.len() as i32,
+            0,
+            -1,
+        );
+        hb_buffer_guess_segment_properties(buf);
+        hb_shape(font, buf, core::ptr::null(), 0);
+    }
+
+    // SAFETY: `buf` is live. This is the only error channel the buffer API has.
+    if unsafe { hb_buffer_allocation_successful(buf) } == 0 {
+        // SAFETY: `buf` is live and owned by us.
+        unsafe { hb_buffer_destroy(buf) };
+        return None;
+    }
+
+    let mut len: c_uint = 0;
+    // SAFETY: `buf` is live; both calls fill `len` with the same count, and the
+    // arrays they return are valid until `buf` is modified or destroyed.
+    let (infos, positions) = unsafe {
+        let i = hb_buffer_get_glyph_infos(buf, &mut len);
+        let p = hb_buffer_get_glyph_positions(buf, &mut len);
+        (i, p)
+    };
+
+    let mut out = alloc::vec::Vec::with_capacity(len as usize);
+    for k in 0..len as usize {
+        // SAFETY: `k` is in bounds of both arrays, whose length is `len`.
+        let (info, pos): (&hb_glyph_info_t, &hb_glyph_position_t) =
+            unsafe { (&*infos.add(k), &*positions.add(k)) };
+        out.push((info.codepoint, info.cluster, pos.x_advance));
+    }
+
+    // SAFETY: `buf` is live and owned by us; `out` no longer borrows from it.
+    unsafe { hb_buffer_destroy(buf) };
+    Some(out)
+}
+```
+
+### Reusing one buffer across a paragraph
+
+The whole point of `hb_buffer_clear_contents` is that the allocated arrays
+survive it. Remember that it also clears direction, script, and language, so
+re-establish them on every iteration.
+
+```rust
+use harfbuzz_sys::{
+    HB_DIRECTION_LTR, HB_SCRIPT_LATIN, hb_buffer_add_utf8, hb_buffer_clear_contents,
+    hb_buffer_set_direction, hb_buffer_set_script, hb_buffer_t, hb_font_t, hb_shape,
+};
+
+/// # Safety
+/// `buf` and `font` must be live.
+unsafe fn shape_runs(buf: *mut hb_buffer_t, font: *mut hb_font_t, runs: &[&str]) {
+    for run in runs {
+        // SAFETY: `buf` is live. Clearing resets contents *and* segment
+        // properties, so both must be set again below.
+        unsafe {
+            hb_buffer_clear_contents(buf);
+            hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
+            hb_buffer_set_script(buf, HB_SCRIPT_LATIN);
+            hb_buffer_add_utf8(
+                buf,
+                run.as_ptr() as *const core::ffi::c_char,
+                run.len() as i32,
+                0,
+                -1,
+            );
+            hb_shape(font, buf, core::ptr::null(), 0);
+        }
+        // ... read the results here, before the next iteration invalidates them.
+    }
+}
+```
+
+### Shaping a run with its surrounding context
+
+Pass the whole paragraph and delimit the run, so the shaper sees the joining
+context on both sides. Cluster values then come back as offsets into the
+paragraph, which is usually what you want anyway.
+
+```rust
+use core::ffi::c_char;
+use harfbuzz_sys::{hb_buffer_add_utf8, hb_buffer_t};
+
+/// Add `paragraph[run]` to `buf`, keeping the rest of `paragraph` as context.
+///
+/// # Safety
+/// `buf` must be live and empty; `run` must be a byte range of `paragraph`
+/// that falls on character boundaries.
+unsafe fn add_run(buf: *mut hb_buffer_t, paragraph: &str, run: core::ops::Range<usize>) {
+    // SAFETY: the pointer covers `paragraph.len()` valid UTF-8 bytes, and the
+    // offset/length window lies inside it. Text outside the window becomes up
+    // to five code points of pre- and post-context.
+    unsafe {
+        hb_buffer_add_utf8(
+            buf,
+            paragraph.as_ptr() as *const c_char,
+            paragraph.len() as i32,
+            run.start as u32,
+            (run.end - run.start) as i32,
+        );
+    }
+}
+```
+
+### Serializing a buffer for debugging or tests
+
+`hb_buffer_serialize` returns an item count, not a byte count, so the loop
+advances `start` by the return value until the whole range is consumed.
+
+```rust
+use core::ffi::{c_char, c_uint};
+use harfbuzz_sys::{
+    HB_BUFFER_SERIALIZE_FLAG_DEFAULT, HB_BUFFER_SERIALIZE_FORMAT_TEXT, hb_buffer_get_length,
+    hb_buffer_serialize, hb_buffer_t, hb_font_t,
+};
+
+/// # Safety
+/// `buf` must be live; `font` may be null.
+unsafe fn serialize(buf: *mut hb_buffer_t, font: *mut hb_font_t) -> alloc::string::String {
+    // SAFETY: `buf` is live.
+    let len = unsafe { hb_buffer_get_length(buf) };
+
+    let mut out = alloc::string::String::new();
+    let mut scratch = [0u8; 1024];
+    let mut start: c_uint = 0;
+
+    while start < len {
+        let mut consumed: c_uint = 0;
+        // SAFETY: `scratch` is `scratch.len()` writable bytes; `consumed`
+        // receives the number of bytes actually written.
+        let items = unsafe {
+            hb_buffer_serialize(
+                buf,
+                start,
+                len,
+                scratch.as_mut_ptr() as *mut c_char,
+                scratch.len() as c_uint,
+                &mut consumed,
+                font,
+                HB_BUFFER_SERIALIZE_FORMAT_TEXT,
+                HB_BUFFER_SERIALIZE_FLAG_DEFAULT,
+            )
+        };
+        if items == 0 {
+            break; // nothing fit, or the format was invalid
+        }
+        out.push_str(core::str::from_utf8(&scratch[..consumed as usize]).unwrap_or(""));
+        start += items;
+    }
+    out
+}
+```
+
+### Mapping glyphs back to characters
+
+Clusters are the only supported way to relate output to input. With the default
+cluster level and LTR text, cluster values are non-decreasing, so a run of
+glyphs sharing a cluster is one indivisible unit for cursor placement and
+selection:
+
+```rust
+/// Group `(glyph, cluster)` pairs into runs sharing a cluster value.
+fn cluster_runs(glyphs: &[(u32, u32)]) -> alloc::vec::Vec<(u32, usize)> {
+    let mut runs: alloc::vec::Vec<(u32, usize)> = alloc::vec::Vec::new();
+    for &(_, cluster) in glyphs {
+        match runs.last_mut() {
+            Some((c, n)) if *c == cluster => *n += 1,
+            _ => runs.push((cluster, 1)),
+        }
+    }
+    runs
+}
+```
+
+For RTL text the glyphs come back in visual order, so cluster values are
+non-*increasing* instead. Under `HB_BUFFER_CLUSTER_LEVEL_CHARACTERS` and
+`HB_BUFFER_CLUSTER_LEVEL_GRAPHEMES` no monotonicity is guaranteed at all, and
+code that assumes sorted clusters will silently misbehave.
+
+### Choosing a cluster level, in practice
+
+- Text editing, cursor movement, hit testing, and anything that must not split a
+  grapheme → `HB_BUFFER_CLUSTER_LEVEL_MONOTONE_GRAPHEMES` (the default).
+- New code that wants precise character-to-glyph mapping while keeping sorted
+  clusters → `HB_BUFFER_CLUSTER_LEVEL_MONOTONE_CHARACTERS`, which upstream
+  recommends for programs that do not need backward compatibility.
+- Analysis tools that need the exact cluster of every character and can cope
+  with unsorted output → `HB_BUFFER_CLUSTER_LEVEL_CHARACTERS`.
+- Using HarfBuzz as a cheap grapheme segmenter → `HB_BUFFER_CLUSTER_LEVEL_GRAPHEMES`.
+
+## Pitfalls
+
+### Nothing returns null, and almost nothing reports failure
+
+`hb_buffer_create` returns the shared empty buffer instead of null when it
+cannot allocate, and the `add_*` functions return `void`. A buffer that ran out
+of memory therefore looks exactly like a buffer with no text in it. The only
+signal is `hb_buffer_allocation_successful`, and it is worth calling once after
+filling and shaping. Note it returns **false** for `hb_buffer_get_empty()`, so
+the same check covers the constructor's failure path.
+
+### `hb_buffer_clear_contents` clears more than the name suggests
+
+The header says only that it "does not clear the Unicode functions and the
+replacement code point", which reads as though everything else is preserved.
+What it actually clears includes the **segment properties**: after
+`hb_buffer_clear_contents` the direction, script, and language are all unset
+again. A reuse loop that sets them once outside the loop will shape the first
+run correctly and every later run with guessed-or-invalid properties. Set them
+inside the loop, or call `hb_buffer_guess_segment_properties` each time.
+
+### The empty buffer swallows every mutation
+
+`hb_buffer_get_empty()` returns an immutable object. Every setter, every `add_*`
+function, `hb_buffer_reset`, and `hb_buffer_clear_contents` check the
+immutability flag and return silently. If a buffer pointer somehow became the
+empty buffer — the usual cause is an unchecked `hb_buffer_create` under memory
+pressure — all subsequent work is silently discarded. The one documented
+exception is `hb_buffer_set_not_found_variation_selector_glyph`, which does not
+check the flag.
+
+### Pointers from the getters are invalidated by any modification
+
+The arrays returned by `hb_buffer_get_glyph_infos` and
+`hb_buffer_get_glyph_positions` point straight into the buffer. Shaping again,
+adding text, reversing, `hb_buffer_set_length`, `hb_buffer_clear_contents`,
+`hb_buffer_reset`, and destruction all invalidate them, and growth reallocates
+them. In Rust this is the classic FFI lifetime trap: a slice built with
+`slice::from_raw_parts` has an unbounded lifetime and will happily outlive the
+data. Copy what you need out before the next call.
+
+### `item_offset` and `item_length` are in encoding units, not characters
+
+For `hb_buffer_add_utf8` they are bytes; for `hb_buffer_add_utf16`, UTF-16 code
+units; for `hb_buffer_add_utf32`, `hb_buffer_add_codepoints`, and
+`hb_buffer_add_latin1`, code points. Cluster values come back in the same units
+and are offsets into the whole `text` array, not into the sub-range — with
+`item_offset = 10` the first cluster is 10. Getting this wrong produces
+plausible-looking output that maps to the wrong characters.
+
+### Passing only the substring loses shaping context
+
+Slicing a paragraph and passing just the run to `hb_buffer_add_utf8` looks
+equivalent to passing the paragraph with an offset, and is not. Arabic letters
+join across run boundaries and combining marks need their base; the context
+window (five code points on each side) is how HarfBuzz sees them. The pre-context
+is only installed when the buffer is empty and `item_offset > 0`, so a second
+`add_*` call into a non-empty buffer will not add pre-context. `hb_buffer_add`
+clears the post-context outright.
+
+### The content-type transitions are assertions, not errors
+
+`hb_buffer_add_utf8` on a shaped buffer, `hb_buffer_serialize_glyphs` on a
+Unicode buffer, and `hb_buffer_normalize_glyphs` without positions all hit
+internal asserts rather than returning an error code. In a release build the
+behaviour is undefined rather than diagnosed. Reset or clear the buffer between
+roles, and prefer `hb_buffer_serialize`, which dispatches on the content type
+instead of asserting.
+
+### `hb_buffer_append` has assert-level preconditions too
+
+The two buffers must agree on content type and on whether they have positions,
+unless one of them is empty, and neither may be mid-shaping. Calling
+`hb_buffer_get_glyph_positions` on one buffer and not the other is enough to
+make them disagree.
+
+### `hb_buffer_guess_segment_properties` is not thread-safe the first time
+
+It calls `hb_language_get_default`, which calls `setlocale` on first use, and
+`setlocale` is not thread-safe in many implementations. Call
+`hb_language_get_default()` once from a single thread during start-up before any
+worker thread can reach the guess function. Also remember that it only fills in
+properties that are *unset*, and that it inspects the buffer contents — so add
+the text first.
+
+### Serialization returns items, not bytes
+
+The `hb_buffer_serialize*` functions return the number of buffer items written,
+while `buf_consumed` reports the byte count. Treating the return value as a byte
+count truncates or overruns. A return of zero means nothing was written: an
+empty range, an invalid format, or a `buf_size` too small for even one item —
+the three are indistinguishable.
+
+### `hb_buffer_serialize_format_from_string` accepts nonsense
+
+It is `hb_tag_from_string` with the lowercase bits masked off, and performs no
+validation. `hb_buffer_serialize_format_from_string("wibble", -1)` returns a
+non-invalid-looking value that no serializer supports, and serializing with it
+silently returns 0. Validate against `hb_buffer_serialize_list_formats` if the
+string comes from a user.
+
+### `mask` is private, and the flags are only in its low bits
+
+Read glyph flags with `hb_glyph_info_get_glyph_flags`. The rest of `mask` holds
+feature bits that mean nothing outside the shaper, and `var1`/`var2` are
+scratch space whose contents after shaping are unspecified.
+
+### `HB_GLYPH_FLAG_UNSAFE_TO_CONCAT` is off unless you ask for it
+
+It is not produced unless `HB_BUFFER_FLAG_PRODUCE_UNSAFE_TO_CONCAT` was set on
+the buffer during shaping, and the same is true of
+`HB_GLYPH_FLAG_SAFE_TO_INSERT_TATWEEL` and
+`HB_BUFFER_FLAG_PRODUCE_SAFE_TO_INSERT_TATWEEL`. An absent flag therefore does
+not mean "safe"; it may mean "not computed".
+
+### `hb_segment_properties_t` equality includes the private fields
+
+`hb_segment_properties_equal` compares `reserved1` and `reserved2`, while
+`hb_segment_properties_hash` ignores them. A struct built by hand without
+zeroing those fields can hash equal but compare unequal — which breaks hash
+tables keyed on segment properties. Start from `HB_SEGMENT_PROPERTIES_DEFAULT`
+or from `hb_buffer_get_segment_properties`.
+
+### Threading
+
+The header is silent on thread safety. Reference counts are atomic in a normally
+configured build, so `hb_buffer_reference` and `hb_buffer_destroy` may be called
+from multiple threads, but a buffer is a mutable working object and everything
+else — adding text, setting properties, shaping, reading the arrays — must be
+confined to one thread at a time. The usual discipline is one buffer per thread,
+created up front and reused. Note also the `hb_language_get_default` caveat
+above.
+
+### `hb_buffer_normalize_glyphs` is not Unicode normalization
+
+Despite the name it reorders glyphs within clusters into a canonical order so
+that two equivalent shaping results compare equal. It has nothing to do with
+NFC, NFD, or any Unicode normalization form.
