@@ -376,6 +376,29 @@ otherwise. Bit flags; largest enumerator is 2, so the underlying type is `int`.
 
 Since HarfBuzz 14.3.0.
 
+#### `HB_SUBSET_DEPEND_EDGE_FLAGS_T_DEFINED`
+
+```c
+#define HB_SUBSET_DEPEND_EDGE_FLAGS_T_DEFINED
+```
+
+A bare feature-detection guard emitted immediately after the
+`hb_subset_depend_edge_flags_t` typedef, with no value. It exists so that another
+header (or a build that composes HarfBuzz's sources differently) can test whether
+the enumeration has already been declared and avoid re-declaring it — the
+enumeration sits *outside* the `HB_NO_SUBSET_DEPEND` guard while everything else
+in the header sits inside it, so this macro is defined in every build that
+includes `hb-subset-depend.h`, including builds where the depend functions do not
+exist.
+
+Upstream lists it under `<SUBSECTION Private>` of the `hb-subset-depend` section.
+The comment beside it notes that `HB_MARK_AS_FLAG_T` — the C++ helper that gives
+the enumeration bitwise operators — is applied in `hb-depend-data.hh`, an
+internal header, rather than in the public one.
+
+**Not transcribed in Rust.** It is a C preprocessor guard with no value, so it
+has no meaning for FFI and `harfbuzz_sys::subset` does not define an equivalent.
+
 ### Types from elsewhere
 
 `hb_face_t` (`hb-face.h`), `hb_blob_t` (`hb-blob.h`), `hb_set_t` (`hb-set.h`),
@@ -1568,7 +1591,432 @@ pub fn hb_subset_depend_destroy(depend: *mut hb_subset_depend_t);
 Decreases the reference count on `depend`; when it reaches zero the object is
 destroyed and all its memory freed. Since HarfBuzz 14.3.0.
 
-<!-- PART6 -->
+## Usage
+
+### C: the minimal web-font subset
+
+```c
+#include <hb.h>
+#include <hb-subset.h>
+
+/* Returns a blob holding the subsetted font file, or NULL. */
+hb_blob_t *
+subset_to_text (hb_face_t *source, const uint32_t *codepoints, unsigned n)
+{
+  hb_subset_input_t *input = hb_subset_input_create_or_fail ();
+  if (!input) return NULL;
+
+  /* Add the codepoints we need. Glyph closure — composites, GSUB, mirroring —
+     is done for us during plan creation. */
+  hb_set_t *unicodes = hb_subset_input_unicode_set (input);
+  for (unsigned i = 0; i < n; i++)
+    hb_set_add (unicodes, codepoints[i]);
+
+  /* Optional: shrink further. */
+  hb_subset_input_set_flags (input,
+                             HB_SUBSET_FLAGS_NO_HINTING |
+                             HB_SUBSET_FLAGS_DESUBROUTINIZE);
+
+  hb_face_t *subset = hb_subset_or_fail (source, input);
+  hb_subset_input_destroy (input);          /* the face does not reference it */
+  if (!subset) return NULL;
+
+  /* Serialize the built face into a font file. */
+  hb_blob_t *out = hb_face_reference_blob (subset);
+  hb_face_destroy (subset);
+  return out;                                /* caller: hb_blob_destroy */
+}
+```
+
+### C: keep everything except a few tables
+
+```c
+hb_subset_input_t *input = hb_subset_input_create_or_fail ();
+hb_subset_input_keep_everything (input);
+
+/* Now remove what we don't want. Note keep_everything() cleared this set. */
+hb_set_t *drop = hb_subset_input_set (input, HB_SUBSET_SETS_DROP_TABLE_TAG);
+hb_set_add (drop, HB_TAG ('D','S','I','G'));
+hb_set_add (drop, HB_TAG ('S','V','G',' '));
+
+/* And add a flag on top of the five keep_everything() installed. */
+hb_subset_input_set_flags (input,
+                           hb_subset_input_get_flags (input) |
+                           HB_SUBSET_FLAGS_RETAIN_GIDS);
+```
+
+### C: retain specific layout features and scripts
+
+```c
+hb_set_t *feats = hb_subset_input_set (input, HB_SUBSET_SETS_LAYOUT_FEATURE_TAG);
+hb_set_clear (feats);                       /* drop the ~70 defaults */
+hb_set_add (feats, HB_TAG ('k','e','r','n'));
+hb_set_add (feats, HB_TAG ('l','i','g','a'));
+
+hb_set_t *scripts = hb_subset_input_set (input, HB_SUBSET_SETS_LAYOUT_SCRIPT_TAG);
+hb_set_clear (scripts);                     /* default is inverted = all */
+hb_set_add (scripts, HB_TAG ('l','a','t','n'));
+
+/* Keep every name record, in every language. */
+hb_set_t *names = hb_subset_input_set (input, HB_SUBSET_SETS_NAME_ID);
+hb_set_clear (names); hb_set_invert (names);
+hb_set_t *langs = hb_subset_input_set (input, HB_SUBSET_SETS_NAME_LANG_ID);
+hb_set_clear (langs); hb_set_invert (langs);
+```
+
+### C: instancing a variable font
+
+```c
+/* Full instance: pin everything at the design defaults. */
+hb_subset_input_pin_all_axes_to_default (input, face);
+
+/* Or a specific static instance. */
+hb_subset_input_pin_axis_location (input, face, HB_TAG ('w','g','h','t'), 700.f);
+hb_subset_input_pin_axis_to_default (input, face, HB_TAG ('w','d','t','h'));
+
+/* Or partial instancing: keep wght but only 300..500, default 400. */
+hb_subset_input_set_axis_range (input, face, HB_TAG ('w','g','h','t'),
+                                300.f, 500.f, 400.f);
+
+/* Keep the existing minimum, change only the default and maximum. */
+hb_subset_input_set_axis_range (input, face, HB_TAG ('o','p','s','z'),
+                                NAN, 72.f, 14.f);
+
+/* Parse the same thing from a CLI-style string. */
+float mn, mx, def;
+if (hb_subset_axis_range_from_string (":400:500", -1, &mn, &mx, &def))
+  hb_subset_input_set_axis_range (input, face, HB_TAG ('w','g','h','t'), mn, mx, def);
+
+/* And read back what is configured. */
+char buf[128] = "";
+hb_subset_axis_range_to_string (input, HB_TAG ('w','g','h','t'), buf, sizeof buf);
+/* buf is now e.g. "300:400:500" */
+```
+
+### C: split plan and execution to inspect the glyph mapping
+
+```c
+hb_subset_plan_t *plan = hb_subset_plan_create_or_fail (face, input);
+if (!plan) return;
+
+/* Available before execution. */
+const hb_map_t *old_to_new = hb_subset_plan_old_to_new_glyph_mapping (plan);
+const hb_map_t *new_to_old = hb_subset_plan_new_to_old_glyph_mapping (plan);
+const hb_map_t *cp_to_old  = hb_subset_plan_unicode_to_old_glyph_mapping (plan);
+
+printf ("kept %u glyphs\n", hb_map_get_population (old_to_new));
+
+hb_face_t *subset = hb_subset_plan_execute_or_fail (plan);
+
+/* The maps are still valid here — they belong to the plan, not the face. */
+hb_subset_plan_destroy (plan);
+if (subset) { /* ... */ hb_face_destroy (subset); }
+```
+
+### C: preprocess once, subset many times
+
+```c
+hb_face_t *fast = hb_subset_preprocess (source);   /* never NULL */
+
+for (int i = 0; i < n_requests; i++)
+{
+  hb_subset_input_t *in = build_input_for (requests[i]);
+  hb_face_t *out = hb_subset_or_fail (fast, in);
+  /* ... */
+  hb_subset_input_destroy (in);
+  hb_face_destroy (out);
+}
+
+hb_face_destroy (fast);
+/* `source` (and whatever memory backs it) must outlive `fast`. */
+```
+
+### C: the repacker on its own
+
+```c
+/* Two objects: a child at objidx 1 and a root that points at it. */
+char child[4]  = { 0, 0, 0, 0 };
+char root[2]   = { 0, 0 };                 /* one 16-bit offset at position 0 */
+
+hb_subset_serialize_link_t root_links[] = {
+  { .width = 2, .position = 0, .objidx = 1 }   /* 1-based: names hb_objects[0] */
+};
+
+hb_subset_serialize_object_t objs[] = {
+  { .head = child, .tail = child + sizeof child,
+    .num_real_links = 0, .real_links = NULL,
+    .num_virtual_links = 0, .virtual_links = NULL },
+  { .head = root, .tail = root + sizeof root,     /* last entry = graph root */
+    .num_real_links = 1, .real_links = root_links,
+    .num_virtual_links = 0, .virtual_links = NULL },
+};
+
+hb_blob_t *packed = hb_subset_serialize_or_fail (HB_TAG ('G','S','U','B'),
+                                                 objs, 2);
+if (packed) { /* ... */ hb_blob_destroy (packed); }
+```
+
+Pass `HB_TAG_NONE` instead of `GSUB` to skip table-specific optimizations.
+
+### Rust: end-to-end subset
+
+```rust
+use core::ffi::c_uint;
+use harfbuzz_sys::{
+    hb_blob_destroy, hb_blob_get_data, hb_face_destroy, hb_face_reference_blob, hb_face_t,
+    hb_set_add,
+};
+use harfbuzz_sys::subset::{
+    hb_subset_input_create_or_fail, hb_subset_input_destroy, hb_subset_input_set_flags,
+    hb_subset_input_unicode_set, hb_subset_or_fail, HB_SUBSET_FLAGS_DESUBROUTINIZE,
+    HB_SUBSET_FLAGS_NO_HINTING,
+};
+
+/// Subset `source` down to `codepoints` and return the font-file bytes.
+///
+/// # Safety
+/// `source` must be a live, non-null `hb_face_t`.
+unsafe fn subset_to_bytes(source: *mut hb_face_t, codepoints: &[u32]) -> Option<Vec<u8>> {
+    // SAFETY: no arguments; returns null on failure, which we check.
+    let input = unsafe { hb_subset_input_create_or_fail() };
+    if input.is_null() {
+        return None;
+    }
+
+    // SAFETY: `input` is non-null and owned by us. The returned set belongs to
+    // the input and stays valid while we hold it; we never destroy it.
+    unsafe {
+        let unicodes = hb_subset_input_unicode_set(input);
+        for &cp in codepoints {
+            hb_set_add(unicodes, cp);
+        }
+        // set_flags takes c_uint while get_flags returns c_int; cast on the way in.
+        hb_subset_input_set_flags(
+            input,
+            (HB_SUBSET_FLAGS_NO_HINTING | HB_SUBSET_FLAGS_DESUBROUTINIZE) as c_uint,
+        );
+    }
+
+    // SAFETY: both pointers are live. The call does not consume `input`.
+    let subset = unsafe { hb_subset_or_fail(source, input) };
+
+    // SAFETY: single matching release for the create above.
+    unsafe { hb_subset_input_destroy(input) };
+
+    if subset.is_null() {
+        return None;
+    }
+
+    // SAFETY: `subset` is a live face; reference_blob hands us a new reference
+    // we own, and the data pointer is valid until we destroy that blob.
+    let bytes = unsafe {
+        let blob = hb_face_reference_blob(subset);
+        let mut len: c_uint = 0;
+        let data = hb_blob_get_data(blob, &mut len);
+        let out = if data.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            core::slice::from_raw_parts(data as *const u8, len as usize).to_vec()
+        };
+        hb_blob_destroy(blob);
+        hb_face_destroy(subset);
+        out
+    };
+
+    Some(bytes)
+}
+```
+
+### Rust: partial instancing with the NaN sentinel
+
+```rust
+use harfbuzz_sys::{hb_face_t, HB_TAG};
+use harfbuzz_sys::subset::{
+    hb_subset_input_set_axis_range, hb_subset_input_t,
+};
+
+/// Narrow `wght` to 300..500 and leave the face's own default in place.
+///
+/// # Safety
+/// `input` and `face` must both be live and non-null.
+unsafe fn narrow_weight(input: *mut hb_subset_input_t, face: *mut hb_face_t) -> bool {
+    // f32::NAN means "keep the value the face's fvar already has".
+    // SAFETY: both pointers are live by the caller's contract.
+    unsafe {
+        hb_subset_input_set_axis_range(
+            input,
+            face,
+            HB_TAG(b'w', b'g', b'h', b't'),
+            300.0,
+            500.0,
+            f32::NAN,
+        ) != 0
+    }
+}
+```
+
+### Rust: walking the dependency graph (needs `experimental`)
+
+```rust
+use core::ffi::c_uint;
+use harfbuzz_sys::{hb_codepoint_t, hb_face_t, hb_set_create, hb_set_destroy, HB_CODEPOINT_INVALID};
+use harfbuzz_sys::subset::{
+    hb_subset_depend_destroy, hb_subset_depend_entry_t, hb_subset_depend_from_face_or_fail,
+    hb_subset_depend_lookup_glyph, hb_subset_depend_lookup_set,
+};
+
+/// Every glyph that `gid` pulls in, plus the ligature/context sets involved.
+///
+/// # Safety
+/// `face` must be a live, non-null `hb_face_t`.
+unsafe fn dependencies_of(face: *mut hb_face_t, gid: hb_codepoint_t) -> Vec<hb_codepoint_t> {
+    // SAFETY: returns null on failure, which we check before using it.
+    let depend = unsafe { hb_subset_depend_from_face_or_fail(face) };
+    if depend.is_null() {
+        return Vec::new();
+    }
+
+    // SAFETY: null out-parameters query the total count only.
+    let total = unsafe {
+        hb_subset_depend_lookup_glyph(depend, gid, 0, core::ptr::null_mut(), core::ptr::null_mut())
+    } as usize;
+
+    let mut entries = vec![
+        hb_subset_depend_entry_t {
+            table_tag: 0,
+            dependent: 0,
+            layout_tag: 0,
+            ligature_set_index: HB_CODEPOINT_INVALID,
+            context_set_index: HB_CODEPOINT_INVALID,
+            flags: 0,
+        };
+        total
+    ];
+    let mut count = total as c_uint;
+
+    // SAFETY: `entries` has room for `count` records, which is what the in/out
+    // `count` parameter promises.
+    unsafe { hb_subset_depend_lookup_glyph(depend, gid, 0, &mut count, entries.as_mut_ptr()) };
+    entries.truncate(count as usize);
+
+    let out = entries.iter().map(|e| e.dependent).collect();
+
+    // Resolving a ligature component set, for illustration.
+    // SAFETY: `set` is ours to own and destroy; lookup_set replaces its contents.
+    unsafe {
+        let set = hb_set_create();
+        for e in &entries {
+            if e.ligature_set_index != HB_CODEPOINT_INVALID {
+                let _ = hb_subset_depend_lookup_set(depend, e.ligature_set_index, set);
+                // ... iterate `set` with hb_set_next ...
+            }
+        }
+        hb_set_destroy(set);
+        hb_subset_depend_destroy(depend);
+    }
+
+    out
+}
+```
+
+## Pitfalls
+
+- **A fresh input is not empty.** It already drops sixteen tables (including all
+  the Graphite and AAT ones and `SVG `), restricts `name` to IDs 0–6 in US
+  English, and restricts layout features to fontTools' curated list. If your
+  output is missing something you never asked to remove, this is why. Start from
+  `hb_subset_input_keep_everything()` and subtract instead.
+
+- **`hb_subset_input_set_flags` replaces the whole field.** It does not OR into
+  the existing value. Calling it after `keep_everything()` silently discards the
+  five flags that function installed. Read-modify-write through
+  `hb_subset_input_get_flags()`.
+
+- **The flag getter and setter disagree on type.** `get_flags` returns
+  `hb_subset_flags_t` (`c_int`), `set_flags` takes `unsigned` (`c_uint`). Round
+  trips need a cast in Rust; in C the implicit conversion hides it.
+
+- **`hb_subset_input_set` is not bounds-checked.** It indexes an internal array
+  with the raw `set_type`. Only pass values in 0–7. In Rust the parameter is a
+  bare `c_int`, so nothing stops you passing 99, and the result is an
+  out-of-bounds read.
+
+- **Sets and maps returned by the input and the plan are borrowed.** Every one of
+  `hb_subset_input_unicode_set`, `_glyph_set`, `_set`,
+  `_old_to_new_glyph_mapping`, and all three `hb_subset_plan_*_mapping` functions
+  is `transfer none`. Destroying any of them corrupts the owning object.
+
+- **The plan's maps die with the plan.** They stay valid after
+  `hb_subset_plan_execute_or_fail()` — but not after
+  `hb_subset_plan_destroy()`. Copy anything you need to keep.
+
+- **`hb_subset_or_fail` does not give you a font file directly.** The returned
+  `hb_face_t` is a built face; you must call `hb_face_reference_blob()` on it to
+  serialize the bytes, and destroy that blob afterwards.
+
+- **`hb_subset_preprocess` never fails visibly.** On any error it returns a new
+  reference to the *source* face. Your subsequent subsets will be correct but
+  slow, and nothing will tell you. Also note its lifetime rule: the preprocessed
+  face may hold sub-blobs pointing into memory the source face does not own, and
+  that memory must outlive the preprocessed face.
+
+- **`pin_all_axes_to_default` returns false for a non-variable font.** A `false`
+  return is therefore not proof of an error. Check
+  `hb_ot_var_get_axis_count()` first if the distinction matters.
+
+- **Axis values are clamped, not validated.** `pin_axis_location` silently pulls
+  an out-of-range value to the nearest `fvar` bound, and `set_axis_range` clamps
+  min, max, and then default. You will not be told that the font could not do
+  what you asked.
+
+- **NaN is a load-bearing sentinel in the axis API.** In
+  `hb_subset_input_set_axis_range` it means "keep the existing value", and
+  `hb_subset_axis_range_from_string` emits it for empty components and for the
+  literal `drop`. Never compare these floats with `==`; use `is_nan()`.
+
+- **`hb_subset_input_get_axis_range` writes all three out-parameters.** Unlike
+  most HarfBuzz out-parameters they are not optional — passing null crashes.
+
+- **`hb_subset_axis_range_to_string` reports nothing.** It returns `void` and
+  writes nothing at all when `size` is 0 or when the axis has no configured
+  range, leaving your buffer untouched. Pre-zero it.
+
+- **An explicit old-to-new glyph map conflicts with `RETAIN_GIDS`.** The two
+  cannot both be active. And a non-monotonic map, while accepted, can produce
+  unsorted `Coverage` tables that validators such as OTS reject.
+
+- **The repacker's `objidx` values are 1-based.** `hb_subset_serialize_or_fail`
+  pushes a null placeholder before your objects, so `objidx = 1` refers to
+  `hb_objects[0]`. The last object in the array is the graph root. Getting this
+  wrong produces a silently wrong table, not an error.
+
+- **The repacker writes into your buffers.** `hb_subset_serialize_object_t.head`
+  is `char *`, not `const char *`, because resolved offsets are written back into
+  the bytes you supplied. Do not pass read-only or shared memory.
+
+- **`platform_id == 1` restricts `hb_subset_input_override_name_table` to
+  ASCII.** A non-ASCII string for the Macintosh platform is silently ignored and
+  the call returns false — it is not an allocation failure.
+
+- **The whole depend API can be absent at link time.** `HB_NO_SUBSET_DEPEND` is
+  defined unless `HB_EXPERIMENTAL_API` is set, and it is *also* defined by
+  `HB_LEAN` and `HB_TINY`. Enabling the crate's `experimental` feature while also
+  enabling `lean` or `tiny` leaves you with declarations that will not link.
+
+- **Depend closure over-approximates by design.** Edges flagged
+  `FROM_CONTEXT_POSITION` or `FROM_NESTED_CONTEXT` may never fire at runtime.
+  Treat the graph as a conservative superset of what
+  `hb_ot_layout_lookups_substitute_closure()` would produce, and remember that
+  UVS and `VARC` dependencies are not represented at all.
+
+- **`hb_subset_depend_lookup_set` replaces the output set.** It does not union
+  into it. If you are accumulating across several entries, copy out after each
+  call or use a scratch set.
+
+- **Everything behind `experimental` may vanish.** Upstream marks these
+  `XSince: EXPERIMENTAL` and offers no compatibility promise across point
+  releases.
+
 
 
 

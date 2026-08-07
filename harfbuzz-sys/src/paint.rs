@@ -1095,7 +1095,7 @@ unsafe extern "C" {
     /// Pushes the transform that maps font-unit coordinates into `font`'s scaled
     /// space.
     ///
-    /// Since HarfBuzz 7.0.0.
+    /// Since HarfBuzz 11.0.0.
     pub fn hb_paint_push_font_transform(
         funcs: *mut hb_paint_funcs_t,
         paint_data: *mut c_void,
@@ -1106,7 +1106,7 @@ unsafe extern "C" {
     /// [`hb_paint_push_font_transform`], mapping `font`'s scaled space back to
     /// font units.
     ///
-    /// Since HarfBuzz 8.2.0.
+    /// Since HarfBuzz 11.0.0.
     pub fn hb_paint_push_inverse_font_transform(
         funcs: *mut hb_paint_funcs_t,
         paint_data: *mut c_void,
