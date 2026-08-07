@@ -1138,3 +1138,1166 @@ Returns the number of items in the buffer — characters before shaping, glyphs
 after. Valid only as long as the buffer is not modified.
 
 **Notes** — since HarfBuzz 0.9.2.
+
+### Segment properties
+
+Every setter in this group silently does nothing on an immutable buffer, and
+none of them validates its argument.
+
+#### `hb_buffer_set_direction`
+
+```c
+void hb_buffer_set_direction (hb_buffer_t    *buffer,
+                              hb_direction_t  direction);
+```
+
+```rust
+pub fn hb_buffer_set_direction(buffer: *mut hb_buffer_t, direction: hb_direction_t);
+```
+
+Sets the text flow direction of the buffer.
+
+**No shaping can happen without setting the direction.** It controls the visual
+direction of the output glyphs — for an RTL direction the glyphs come back
+reversed — and many layout features depend on it. Note in particular that
+reversing RTL text before shaping and then shaping with LTR is *not* the same as
+keeping the text in logical order and shaping with RTL.
+
+**Notes** — since HarfBuzz 0.9.2. The value is stored verbatim, including
+`HB_DIRECTION_INVALID`; `hb_buffer_guess_segment_properties` is what fills an
+unset direction in.
+
+#### `hb_buffer_get_direction`
+
+```c
+hb_direction_t hb_buffer_get_direction (const hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_direction(buffer: *const hb_buffer_t) -> hb_direction_t;
+```
+
+Fetches the text flow direction. Returns `HB_DIRECTION_INVALID` when unset.
+Since HarfBuzz 0.9.2.
+
+#### `hb_buffer_set_script`
+
+```c
+void hb_buffer_set_script (hb_buffer_t *buffer,
+                           hb_script_t  script);
+```
+
+```rust
+pub fn hb_buffer_set_script(buffer: *mut hb_buffer_t, script: hb_script_t);
+```
+
+Sets the script of the buffer.
+
+Script is crucial for choosing the proper shaping behaviour for scripts that
+require it (Arabic, for instance) and for deciding which OpenType features
+defined in the font are applied. Pass one of the predefined `HB_SCRIPT_*`
+values, or derive one with `hb_script_from_string` / `hb_script_from_iso15924_tag`.
+
+**Notes** — since HarfBuzz 0.9.2.
+
+#### `hb_buffer_get_script`
+
+```c
+hb_script_t hb_buffer_get_script (const hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_script(buffer: *const hb_buffer_t) -> hb_script_t;
+```
+
+Fetches the script. Returns `HB_SCRIPT_INVALID` when unset. Since HarfBuzz
+0.9.2.
+
+#### `hb_buffer_set_language`
+
+```c
+void hb_buffer_set_language (hb_buffer_t   *buffer,
+                             hb_language_t  language);
+```
+
+```rust
+pub fn hb_buffer_set_language(buffer: *mut hb_buffer_t, language: hb_language_t);
+```
+
+Sets the language of the buffer.
+
+Languages select which OpenType features apply, which can produce
+language-specific behaviour. They are orthogonal to scripts: related concepts,
+but different, and not to be confused. Use `hb_language_from_string` to convert
+a BCP 47 tag into an `hb_language_t`.
+
+**Ownership** — `hb_language_t` values are interned for the lifetime of the
+process, so nothing is copied and nothing needs freeing.
+
+**Notes** — since HarfBuzz 0.9.2.
+
+#### `hb_buffer_get_language`
+
+```c
+hb_language_t hb_buffer_get_language (const hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_language(buffer: *const hb_buffer_t) -> hb_language_t;
+```
+
+Fetches the language. Returns `HB_LANGUAGE_INVALID` (null) when unset. The
+returned value must not be freed by the caller. Since HarfBuzz 0.9.2.
+
+#### `hb_buffer_set_segment_properties`
+
+```c
+void hb_buffer_set_segment_properties (hb_buffer_t *buffer,
+                                       const hb_segment_properties_t *props);
+```
+
+```rust
+pub fn hb_buffer_set_segment_properties(
+    buffer: *mut hb_buffer_t,
+    props: *const hb_segment_properties_t,
+);
+```
+
+Sets the buffer's direction, script, and language in one call — a shortcut for
+calling the three setters individually.
+
+**Ownership** — `props` is copied by value; the caller keeps ownership of the
+struct and may free it immediately.
+
+**Notes** — since HarfBuzz 0.9.7. The whole struct is copied, reserved fields
+included, so build it from `HB_SEGMENT_PROPERTIES_DEFAULT` or from
+`hb_buffer_get_segment_properties` rather than from uninitialised memory.
+
+#### `hb_buffer_get_segment_properties`
+
+```c
+void hb_buffer_get_segment_properties (const hb_buffer_t *buffer,
+                                       hb_segment_properties_t *props);
+```
+
+```rust
+pub fn hb_buffer_get_segment_properties(
+    buffer: *const hb_buffer_t,
+    props: *mut hb_segment_properties_t,
+);
+```
+
+Copies the buffer's segment properties into `*props`. `props` is an
+out-parameter and must point at writable storage; it is fully overwritten, so it
+need not be initialised. Since HarfBuzz 0.9.7.
+
+#### `hb_buffer_guess_segment_properties`
+
+```c
+void hb_buffer_guess_segment_properties (hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_guess_segment_properties(buffer: *mut hb_buffer_t);
+```
+
+Sets *unset* segment properties from the buffer's Unicode contents. Properties
+that are already set are left alone. If the buffer is not empty it must have
+content type `HB_BUFFER_CONTENT_TYPE_UNICODE`.
+
+The three steps, in order:
+
+1. If the script is `HB_SCRIPT_INVALID`, it becomes the Unicode script of the
+   first character in the buffer whose script is not `HB_SCRIPT_COMMON`,
+   `HB_SCRIPT_INHERITED`, or `HB_SCRIPT_UNKNOWN`.
+2. If the direction is `HB_DIRECTION_INVALID`, it becomes
+   `hb_script_get_horizontal_direction` of the (possibly just-guessed) script;
+   if that returns `HB_DIRECTION_INVALID`, `HB_DIRECTION_LTR` is used.
+3. If the language is `HB_LANGUAGE_INVALID`, it becomes the process default from
+   `hb_language_get_default`.
+
+**Notes** — since HarfBuzz 0.9.7. `hb_language_get_default` is **not thread-safe
+the first time it is called**, because it calls `setlocale`; call it once from a
+single thread before any other thread can reach this function. Upstream notes
+the language choice may change in the future to take the script into account.
+Because step 1 looks at the buffer contents, add the text *before* calling this.
+
+#### `hb_segment_properties_equal`
+
+```c
+hb_bool_t hb_segment_properties_equal (const hb_segment_properties_t *a,
+                                       const hb_segment_properties_t *b);
+```
+
+```rust
+pub fn hb_segment_properties_equal(
+    a: *const hb_segment_properties_t,
+    b: *const hb_segment_properties_t,
+) -> hb_bool_t;
+```
+
+Checks the equality of two `hb_segment_properties_t`.
+
+**Returns** — true if *all* properties of `a` equal those of `b`. The comparison
+includes the two private reserved fields, so structs that were not zero-
+initialised can compare unequal despite matching direction, script, and
+language.
+
+**Notes** — since HarfBuzz 0.9.7. Language comparison is a pointer comparison,
+which is correct because languages are interned.
+
+#### `hb_segment_properties_hash`
+
+```c
+unsigned int hb_segment_properties_hash (const hb_segment_properties_t *p);
+```
+
+```rust
+pub fn hb_segment_properties_hash(p: *const hb_segment_properties_t) -> c_uint;
+```
+
+Creates a hash representing `p`, suitable for use as a map key. Computed as
+`(direction * 31 + script) * 31 + (uintptr) language`, so it ignores the
+reserved fields even though `hb_segment_properties_equal` does not.
+
+**Notes** — since HarfBuzz 0.9.7. Not a stable hash across processes: it mixes
+in an interned pointer value.
+
+#### `hb_segment_properties_overlay`
+
+```c
+void hb_segment_properties_overlay (hb_segment_properties_t *p,
+                                    const hb_segment_properties_t *src);
+```
+
+```rust
+pub fn hb_segment_properties_overlay(
+    p: *mut hb_segment_properties_t,
+    src: *const hb_segment_properties_t,
+);
+```
+
+Fills in missing fields of `p` from `src` in a considered manner:
+
+1. If `p` has no direction, the direction is copied from `src`.
+2. If `p` and `src` now have the same direction (which may be unset) and `p` has
+   no script, the script is copied.
+3. If `p` and `src` have the same direction and script (either may be unset) and
+   `p` has no language, the language is copied.
+
+The cascade stops as soon as a field disagrees, so a `p` whose direction differs
+from `src`'s inherits nothing at all.
+
+**Notes** — since HarfBuzz 3.3.0. Tolerates null for either argument (returns
+immediately). This is the function `hb_buffer_append` uses internally.
+
+### Content type and Unicode functions
+
+#### `hb_buffer_set_content_type`
+
+```c
+void hb_buffer_set_content_type (hb_buffer_t              *buffer,
+                                 hb_buffer_content_type_t  content_type);
+```
+
+```rust
+pub fn hb_buffer_set_content_type(
+    buffer: *mut hb_buffer_t,
+    content_type: hb_buffer_content_type_t,
+);
+```
+
+Sets the type of the buffer's contents. **You rarely need this**, because a
+number of other functions transition the content type for you:
+
+- A newly created buffer starts at `HB_BUFFER_CONTENT_TYPE_INVALID`.
+  `hb_buffer_reset`, `hb_buffer_clear_contents`, and `hb_buffer_set_length` with
+  an argument of zero all return it to invalid.
+- `hb_buffer_add_utf8`, `hb_buffer_add_utf16`, `hb_buffer_add_utf32`,
+  `hb_buffer_add_codepoints`, and `hb_buffer_add_latin1` expect the buffer to be
+  either empty with content type invalid, or already
+  `HB_BUFFER_CONTENT_TYPE_UNICODE`; they set the type to Unicode when they add
+  to an empty buffer.
+- `hb_shape` and `hb_shape_full` expect the same, and on success set the type to
+  `HB_BUFFER_CONTENT_TYPE_GLYPHS`.
+
+The transitions are designed so that a "reset : add-text : shape" loop never has
+to touch the content type manually.
+
+**Notes** — since HarfBuzz 0.9.5. Silently does nothing on an immutable buffer.
+Legitimate uses are narrow: telling HarfBuzz that a hand-filled buffer contains
+glyphs, or forcing a buffer's type before `hb_buffer_serialize`.
+
+#### `hb_buffer_get_content_type`
+
+```c
+hb_buffer_content_type_t hb_buffer_get_content_type (const hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_content_type(buffer: *const hb_buffer_t) -> hb_buffer_content_type_t;
+```
+
+Fetches the type of the buffer's contents. Since HarfBuzz 0.9.5.
+
+#### `hb_buffer_set_unicode_funcs`
+
+```c
+void hb_buffer_set_unicode_funcs (hb_buffer_t        *buffer,
+                                  hb_unicode_funcs_t *unicode_funcs);
+```
+
+```rust
+pub fn hb_buffer_set_unicode_funcs(
+    buffer: *mut hb_buffer_t,
+    unicode_funcs: *mut hb_unicode_funcs_t,
+);
+```
+
+Sets the Unicode-functions structure the buffer uses to look up character
+properties — general category, combining class, mirroring, composition, and
+decomposition. See `unicode.md`.
+
+**Ownership** — the buffer takes a reference on `unicode_funcs` and drops its
+reference on the previous one. The caller keeps its own reference and must still
+destroy it.
+
+**Notes** — since HarfBuzz 0.9.2. Passing null installs the default Unicode
+functions. Silently does nothing on an immutable buffer.
+
+#### `hb_buffer_get_unicode_funcs`
+
+```c
+hb_unicode_funcs_t *hb_buffer_get_unicode_funcs (const hb_buffer_t  *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_unicode_funcs(buffer: *const hb_buffer_t) -> *mut hb_unicode_funcs_t;
+```
+
+Fetches the Unicode-functions structure attached to the buffer. No ownership is
+transferred — the buffer keeps its reference, so take your own with
+`hb_unicode_funcs_reference` if you intend to outlive the buffer. Since
+HarfBuzz 0.9.2.
+
+### Flags and cluster level
+
+#### `hb_buffer_set_flags`
+
+```c
+void hb_buffer_set_flags (hb_buffer_t       *buffer,
+                          hb_buffer_flags_t  flags);
+```
+
+```rust
+pub fn hb_buffer_set_flags(buffer: *mut hb_buffer_t, flags: hb_buffer_flags_t);
+```
+
+Sets the buffer's flags, replacing the previous set wholesale — to add a flag,
+OR it into the result of `hb_buffer_get_flags`. Since HarfBuzz 0.9.7. Silently
+does nothing on an immutable buffer.
+
+#### `hb_buffer_get_flags`
+
+```c
+hb_buffer_flags_t hb_buffer_get_flags (const hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_flags(buffer: *const hb_buffer_t) -> hb_buffer_flags_t;
+```
+
+Fetches the buffer's flags. Since HarfBuzz 0.9.7.
+
+#### `hb_buffer_set_cluster_level`
+
+```c
+void hb_buffer_set_cluster_level (hb_buffer_t               *buffer,
+                                  hb_buffer_cluster_level_t  cluster_level);
+```
+
+```rust
+pub fn hb_buffer_set_cluster_level(
+    buffer: *mut hb_buffer_t,
+    cluster_level: hb_buffer_cluster_level_t,
+);
+```
+
+Sets the cluster level, which controls how cluster values are grouped. See
+`hb_buffer_cluster_level_t` for what each level means. Since HarfBuzz 0.9.42.
+Silently does nothing on an immutable buffer. Set it before shaping; changing it
+afterwards does not re-group anything.
+
+#### `hb_buffer_get_cluster_level`
+
+```c
+hb_buffer_cluster_level_t hb_buffer_get_cluster_level (const hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_cluster_level(buffer: *const hb_buffer_t) -> hb_buffer_cluster_level_t;
+```
+
+Fetches the buffer's cluster level. Since HarfBuzz 0.9.42.
+
+### Substitution code points and glyphs
+
+#### `hb_buffer_set_replacement_codepoint`
+
+```c
+void hb_buffer_set_replacement_codepoint (hb_buffer_t    *buffer,
+                                          hb_codepoint_t  replacement);
+```
+
+```rust
+pub fn hb_buffer_set_replacement_codepoint(
+    buffer: *mut hb_buffer_t,
+    replacement: hb_codepoint_t,
+);
+```
+
+Sets the code point that replaces invalid entries for a given encoding when
+adding text to the buffer — used by `hb_buffer_add_utf8`, `_utf16`, and
+`_utf32`. Defaults to `HB_BUFFER_REPLACEMENT_CODEPOINT_DEFAULT` (U+FFFD).
+
+**Notes** — since HarfBuzz 0.9.31. Set it before adding text; it is consulted at
+add time, not at shape time. Silently does nothing on an immutable buffer.
+Preserved by `hb_buffer_clear_contents`, restored to the default by
+`hb_buffer_reset`.
+
+#### `hb_buffer_get_replacement_codepoint`
+
+```c
+hb_codepoint_t hb_buffer_get_replacement_codepoint (const hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_replacement_codepoint(buffer: *const hb_buffer_t) -> hb_codepoint_t;
+```
+
+Fetches the replacement code point. Since HarfBuzz 0.9.31.
+
+#### `hb_buffer_set_invisible_glyph`
+
+```c
+void hb_buffer_set_invisible_glyph (hb_buffer_t    *buffer,
+                                    hb_codepoint_t  invisible);
+```
+
+```rust
+pub fn hb_buffer_set_invisible_glyph(buffer: *mut hb_buffer_t, invisible: hb_codepoint_t);
+```
+
+Sets the glyph that replaces invisible characters in the shaping result. If set
+to zero (the default), the glyph for U+0020 SPACE is used; any other value is
+used verbatim.
+
+**Notes** — since HarfBuzz 2.0.0. This is the glyph substituted for hidden
+`Default_Ignorable` characters, so it interacts with
+`HB_BUFFER_FLAG_PRESERVE_DEFAULT_IGNORABLES` and
+`HB_BUFFER_FLAG_REMOVE_DEFAULT_IGNORABLES`. Silently does nothing on an
+immutable buffer.
+
+#### `hb_buffer_get_invisible_glyph`
+
+```c
+hb_codepoint_t hb_buffer_get_invisible_glyph (const hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_invisible_glyph(buffer: *const hb_buffer_t) -> hb_codepoint_t;
+```
+
+Fetches the invisible glyph. Since HarfBuzz 2.0.0.
+
+#### `hb_buffer_set_not_found_glyph`
+
+```c
+void hb_buffer_set_not_found_glyph (hb_buffer_t    *buffer,
+                                    hb_codepoint_t  not_found);
+```
+
+```rust
+pub fn hb_buffer_set_not_found_glyph(buffer: *mut hb_buffer_t, not_found: hb_codepoint_t);
+```
+
+Sets the glyph that replaces characters not found in the font during shaping.
+The not-found glyph defaults to zero, sometimes known as the `.notdef` glyph;
+setting it to something else lets you tell a genuine `.notdef` in the font apart
+from a lookup failure.
+
+**Notes** — since HarfBuzz 3.1.0. Silently does nothing on an immutable buffer.
+
+#### `hb_buffer_get_not_found_glyph`
+
+```c
+hb_codepoint_t hb_buffer_get_not_found_glyph (const hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_not_found_glyph(buffer: *const hb_buffer_t) -> hb_codepoint_t;
+```
+
+Fetches the not-found glyph. Since HarfBuzz 3.1.0.
+
+#### `hb_buffer_set_not_found_variation_selector_glyph`
+
+```c
+void hb_buffer_set_not_found_variation_selector_glyph (hb_buffer_t    *buffer,
+                                                       hb_codepoint_t  not_found_variation_selector);
+```
+
+```rust
+pub fn hb_buffer_set_not_found_variation_selector_glyph(
+    buffer: *mut hb_buffer_t,
+    not_found_variation_selector: hb_codepoint_t,
+);
+```
+
+Sets the glyph that replaces variation-selector characters the font does not
+resolve. The default is `HB_CODEPOINT_INVALID`, in which case an unresolved
+variation selector is removed from the glyph string during shaping. Setting a
+real glyph retains it instead, so the client can detect the situation and react
+— by trying a different font, for instance.
+
+**Notes** — since HarfBuzz 10.0.0. Unlike its siblings, the implementation of
+this setter does **not** check the immutability flag, so it writes even to the
+shared empty buffer.
+
+#### `hb_buffer_get_not_found_variation_selector_glyph`
+
+```c
+hb_codepoint_t hb_buffer_get_not_found_variation_selector_glyph (const hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_not_found_variation_selector_glyph(
+    buffer: *const hb_buffer_t,
+) -> hb_codepoint_t;
+```
+
+Fetches the glyph used for an unresolved variation selector. Since HarfBuzz
+10.0.0.
+
+#### `hb_buffer_set_random_state`
+
+```c
+void hb_buffer_set_random_state (hb_buffer_t    *buffer,
+                                 unsigned        state);
+```
+
+```rust
+pub fn hb_buffer_set_random_state(buffer: *mut hb_buffer_t, state: c_uint);
+```
+
+Sets the buffer's random state, which changes every time a glyph uses randomness
+— the OpenType `rand` feature, for example. Together with
+`hb_buffer_get_random_state` this lets you transfer the current state to a
+subsequent buffer for a better randomness distribution.
+
+**Values** — defaults to 1, including after the buffer contents are cleared. A
+value of **0 disables randomness** during shaping.
+
+**Notes** — since HarfBuzz 8.4.0. Silently does nothing on an immutable buffer.
+
+#### `hb_buffer_get_random_state`
+
+```c
+unsigned hb_buffer_get_random_state (const hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_get_random_state(buffer: *const hb_buffer_t) -> c_uint;
+```
+
+Fetches the buffer's random state. Since HarfBuzz 8.4.0.
+
+### Reading results
+
+#### `hb_buffer_get_glyph_infos`
+
+```c
+hb_glyph_info_t *hb_buffer_get_glyph_infos (hb_buffer_t  *buffer,
+                                            unsigned int *length);
+```
+
+```rust
+pub fn hb_buffer_get_glyph_infos(
+    buffer: *mut hb_buffer_t,
+    length: *mut c_uint,
+) -> *mut hb_glyph_info_t;
+```
+
+Returns the buffer's glyph-information array.
+
+**Parameters**
+
+| Parameter | Meaning |
+| --- | --- |
+| `length` | Out-parameter receiving the array length. May be null if you do not want it. |
+
+**Returns** — a pointer to the array. Upstream annotates it `array
+length=length`; the pointer is non-null for a normal buffer, and for a
+zero-length buffer the length is what tells you there is nothing to read.
+
+**Ownership** — `transfer none`. The array belongs to the buffer and stays valid
+only as long as the buffer contents are not modified — shaping, adding text,
+reversing, `hb_buffer_set_length`, `hb_buffer_clear_contents`, and destruction
+all invalidate it. Do not free it.
+
+**Notes** — since HarfBuzz 0.9.2. The array is writable, and clients do
+sometimes edit it in place; that is outside what the header documents.
+
+#### `hb_buffer_get_glyph_positions`
+
+```c
+hb_glyph_position_t *hb_buffer_get_glyph_positions (hb_buffer_t  *buffer,
+                                                    unsigned int *length);
+```
+
+```rust
+pub fn hb_buffer_get_glyph_positions(
+    buffer: *mut hb_buffer_t,
+    length: *mut c_uint,
+) -> *mut hb_glyph_position_t;
+```
+
+Returns the buffer's glyph-position array.
+
+**Parameters** — `length` is an out-parameter receiving the array length; may be
+null.
+
+**Returns** — a pointer to the array, or **null** in one specific case: if the
+buffer did not already have positions *and* this is called from inside a buffer
+message callback (see `hb_buffer_set_message_func`). Otherwise, if the buffer
+did not have positions, they are created and initialised to zeros.
+
+**Ownership** — `transfer none`, same invalidation rules as
+`hb_buffer_get_glyph_infos`.
+
+**Notes** — since HarfBuzz 0.9.2. Calling this has the side effect of giving the
+buffer a position array, which `hb_buffer_has_positions` will then report and
+which `hb_buffer_append` checks for compatibility. Note also that `length` is
+set *before* the null check, so it is filled in even when null is returned.
+
+#### `hb_buffer_has_positions`
+
+```c
+hb_bool_t hb_buffer_has_positions (hb_buffer_t  *buffer);
+```
+
+```rust
+pub fn hb_buffer_has_positions(buffer: *mut hb_buffer_t) -> hb_bool_t;
+```
+
+Returns whether the buffer has glyph position data. A buffer gains position data
+when `hb_buffer_get_glyph_positions` is called on it (and during shaping), and
+is cleared of position data by `hb_buffer_clear_contents`.
+
+**Notes** — since HarfBuzz 2.7.3. Useful before `hb_buffer_append`, which
+requires both buffers to agree, and before `hb_buffer_normalize_glyphs`, which
+asserts that positions exist.
+
+#### `hb_glyph_info_get_glyph_flags`
+
+```c
+hb_glyph_flags_t hb_glyph_info_get_glyph_flags (const hb_glyph_info_t *info);
+#define hb_glyph_info_get_glyph_flags(info) \
+        ((hb_glyph_flags_t) ((unsigned int) (info)->mask & HB_GLYPH_FLAG_DEFINED))
+```
+
+```rust
+pub fn hb_glyph_info_get_glyph_flags(info: *const hb_glyph_info_t) -> hb_glyph_flags_t;
+```
+
+Returns the `hb_glyph_flags_t` encoded within an `hb_glyph_info_t` — that is,
+`info->mask & HB_GLYPH_FLAG_DEFINED`.
+
+**Notes** — since HarfBuzz 1.5.0. In C the name is *both* a real exported
+function and a function-like macro, and the macro normally wins, so C callers
+get an inline field read. Rust binds to the exported function; the two compute
+exactly the same value. `mask` is otherwise private and must not be interpreted
+by hand.
+
+### Reordering
+
+#### `hb_buffer_reverse`
+
+```c
+void hb_buffer_reverse (hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_reverse(buffer: *mut hb_buffer_t);
+```
+
+Reverses the buffer's contents — both the info array and, if present, the
+position array. Since HarfBuzz 0.9.2.
+
+#### `hb_buffer_reverse_range`
+
+```c
+void hb_buffer_reverse_range (hb_buffer_t *buffer,
+                              unsigned int start, unsigned int end);
+```
+
+```rust
+pub fn hb_buffer_reverse_range(buffer: *mut hb_buffer_t, start: c_uint, end: c_uint);
+```
+
+Reverses the buffer's contents in the range `start` (inclusive) to `end`
+(exclusive). Since HarfBuzz 0.9.41.
+
+#### `hb_buffer_reverse_clusters`
+
+```c
+void hb_buffer_reverse_clusters (hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_reverse_clusters(buffer: *mut hb_buffer_t);
+```
+
+Reverses the buffer's contents, then reverses each cluster again — where a
+cluster is a run of consecutive items sharing a cluster number. The net effect
+is to reverse the order of clusters while keeping the glyph order within each
+cluster intact. Since HarfBuzz 0.9.2.
+
+#### `hb_buffer_normalize_glyphs`
+
+```c
+void hb_buffer_normalize_glyphs (hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_normalize_glyphs(buffer: *mut hb_buffer_t);
+```
+
+Reorders a glyph buffer to have canonical in-cluster glyph order and position.
+The resulting clusters behave identically to the pre-reordering ones; this is
+about making two equivalent shaping results compare equal, which is why
+`hb-shape`-style testing uses it.
+
+**Preconditions** — asserts that the buffer has positions and that its content
+type is `HB_BUFFER_CONTENT_TYPE_GLYPHS`. It reads the buffer direction to decide
+whether clusters run forward or backward.
+
+**Notes** — since HarfBuzz 0.9.2. The header carries an explicit warning: this
+has **nothing to do with Unicode normalization**.
+
+### Serialization
+
+#### `hb_buffer_serialize_format_from_string`
+
+```c
+hb_buffer_serialize_format_t hb_buffer_serialize_format_from_string (const char *str, int len);
+```
+
+```rust
+pub fn hb_buffer_serialize_format_from_string(
+    str_: *const c_char,
+    len: c_int,
+) -> hb_buffer_serialize_format_t;
+```
+
+Parses a string such as `"text"` or `"json"` into an
+`hb_buffer_serialize_format_t`. Pass `len` as `-1` when the string is
+NUL-terminated.
+
+**Returns** — the parsed format. It does **not** check whether the result is a
+supported format: the implementation is `hb_tag_from_string(str, len) &
+~0x20202020u`, i.e. a tag with the lowercase bits cleared, so any four-character
+string produces some value. Use `hb_buffer_serialize_list_formats` to learn
+which ones are real.
+
+**Notes** — since HarfBuzz 0.9.7.
+
+#### `hb_buffer_serialize_format_to_string`
+
+```c
+const char *hb_buffer_serialize_format_to_string (hb_buffer_serialize_format_t format);
+```
+
+```rust
+pub fn hb_buffer_serialize_format_to_string(
+    format: hb_buffer_serialize_format_t,
+) -> *const c_char;
+```
+
+Converts a serialization format to its NUL-terminated name — `"text"` or
+`"json"`.
+
+**Returns** — a static string, or **null** when `format` is not a valid format.
+
+**Ownership** — `transfer none`; the string is static and must not be freed.
+
+**Notes** — since HarfBuzz 0.9.7.
+
+#### `hb_buffer_serialize_list_formats`
+
+```c
+const char **hb_buffer_serialize_list_formats (void);
+```
+
+```rust
+pub fn hb_buffer_serialize_list_formats() -> *mut *const c_char;
+```
+
+Returns the list of supported buffer serialization formats: a NULL-terminated
+array of C strings, currently `{"text", "json", NULL}`.
+
+**Ownership** — `transfer none`; a static array that must not be freed.
+
+**Notes** — since HarfBuzz 0.9.7. The Rust signature is `*mut *const c_char`
+rather than C's `const char **`; the array is still read-only in practice.
+
+#### `hb_buffer_serialize_glyphs`
+
+```c
+unsigned int hb_buffer_serialize_glyphs (hb_buffer_t *buffer,
+                                         unsigned int start,
+                                         unsigned int end,
+                                         char *buf,
+                                         unsigned int buf_size,
+                                         unsigned int *buf_consumed,
+                                         hb_font_t *font,
+                                         hb_buffer_serialize_format_t format,
+                                         hb_buffer_serialize_flags_t flags);
+```
+
+```rust
+pub fn hb_buffer_serialize_glyphs(
+    buffer: *mut hb_buffer_t,
+    start: c_uint,
+    end: c_uint,
+    buf: *mut c_char,
+    buf_size: c_uint,
+    buf_consumed: *mut c_uint,
+    font: *mut hb_font_t,
+    format: hb_buffer_serialize_format_t,
+    flags: hb_buffer_serialize_flags_t,
+) -> c_uint;
+```
+
+Serializes the buffer's glyph content into `buf` as text, which is useful for
+showing the contents of a buffer during debugging or in tests.
+
+**Parameters**
+
+| Parameter | Meaning | Null allowed |
+| --- | --- | --- |
+| `start` | Index of the first item to serialize. Clamped to `end`. | — |
+| `end` | Index one past the last item. Clamped to the buffer length. | — |
+| `buf` | Output string. Set to `""` immediately when `buf_size` is non-zero. | no |
+| `buf_size` | The size of `buf` in bytes. | — |
+| `buf_consumed` | Out-parameter set to the number of bytes written into `buf`. | yes |
+| `font` | The font the buffer was shaped with, needed to read glyph names and extents. | yes — an empty font is used |
+| `format` | `HB_BUFFER_SERIALIZE_FORMAT_TEXT` or `_JSON`. | — |
+| `flags` | Which properties to serialize. | — |
+
+**Returns** — the number of **items** serialized, which is not the number of
+bytes. Zero when `start == end`, when the format is invalid, or when nothing fit
+in `buf`. The idiomatic loop is to call repeatedly with `start` advanced by the
+return value until it reaches `end`, flushing `buf` each time.
+
+**Preconditions** — asserts the buffer's content type is
+`HB_BUFFER_CONTENT_TYPE_GLYPHS`. If the buffer has no positions,
+`HB_BUFFER_SERIALIZE_FLAG_NO_POSITIONS` is forced on.
+
+**Output format** — the `text` format looks like
+
+```text
+[uni0651=0@518,0+0|uni0628=0+1897]
+```
+
+- Serialized glyphs are delimited with `[` and `]`, and separated with `|`.
+- Each glyph starts with its glyph name, or its glyph index if
+  `HB_BUFFER_SERIALIZE_FLAG_NO_GLYPH_NAMES` is set. Then:
+  - unless `NO_CLUSTERS` is set, `=` followed by `hb_glyph_info_t.cluster`;
+  - unless `NO_POSITIONS` is set, the position: `@x_offset,y_offset` if the two
+    offsets are not both zero, then `+x_advance`, then `,y_advance` if the
+    y-advance is not zero;
+  - if `GLYPH_EXTENTS` is set, `<x_bearing,y_bearing,width,height>`.
+
+The `json` format looks like
+
+```json
+[{"g":"uni0651","cl":0,"dx":518,"dy":0,"ax":0,"ay":0},
+ {"g":"uni0628","cl":0,"dx":0,"dy":0,"ax":1897,"ay":0}]
+```
+
+with `g` the glyph name or index, `cl` the cluster (unless `NO_CLUSTERS`),
+`dx`/`dy`/`ax`/`ay` the x-offset, y-offset, x-advance, and y-advance (unless
+`NO_POSITIONS`), and `xb`/`yb`/`w`/`h` the extents' `x_bearing`, `y_bearing`,
+`width`, and `height` (only with `GLYPH_EXTENTS`).
+
+**Notes** — since HarfBuzz 0.9.7.
+
+#### `hb_buffer_serialize_unicode`
+
+```c
+unsigned int hb_buffer_serialize_unicode (hb_buffer_t *buffer,
+                                          unsigned int start,
+                                          unsigned int end,
+                                          char *buf,
+                                          unsigned int buf_size,
+                                          unsigned int *buf_consumed,
+                                          hb_buffer_serialize_format_t format,
+                                          hb_buffer_serialize_flags_t flags);
+```
+
+```rust
+pub fn hb_buffer_serialize_unicode(
+    buffer: *mut hb_buffer_t,
+    start: c_uint,
+    end: c_uint,
+    buf: *mut c_char,
+    buf_size: c_uint,
+    buf_consumed: *mut c_uint,
+    format: hb_buffer_serialize_format_t,
+    flags: hb_buffer_serialize_flags_t,
+) -> c_uint;
+```
+
+Serializes the buffer's *Unicode* content — that is, before shaping. Same
+parameters as `hb_buffer_serialize_glyphs` minus `font`, which is not needed
+because there are no glyph names.
+
+**Output format** — the `text` format looks like
+
+```text
+<U+0651=0|U+0628=1>
+```
+
+Items are separated with `|`, code points are zero-padded four-or-more-digit
+hexadecimal preceded by `U+`, and unless `NO_CLUSTERS` is set the cluster
+follows a `=`. The `json` format is a list of objects with `u` (the code point
+as a decimal integer) and `cl` (the cluster, unless `NO_CLUSTERS`):
+
+```json
+[{"u":1617,"cl":0},{"u":1576,"cl":1}]
+```
+
+**Returns** — the number of items serialized.
+
+**Preconditions** — asserts the content type is
+`HB_BUFFER_CONTENT_TYPE_UNICODE`.
+
+**Notes** — since HarfBuzz 2.7.3.
+
+#### `hb_buffer_serialize`
+
+```c
+unsigned int hb_buffer_serialize (hb_buffer_t *buffer,
+                                  unsigned int start,
+                                  unsigned int end,
+                                  char *buf,
+                                  unsigned int buf_size,
+                                  unsigned int *buf_consumed,
+                                  hb_font_t *font,
+                                  hb_buffer_serialize_format_t format,
+                                  hb_buffer_serialize_flags_t flags);
+```
+
+```rust
+pub fn hb_buffer_serialize(
+    buffer: *mut hb_buffer_t,
+    start: c_uint,
+    end: c_uint,
+    buf: *mut c_char,
+    buf_size: c_uint,
+    buf_consumed: *mut c_uint,
+    font: *mut hb_font_t,
+    format: hb_buffer_serialize_format_t,
+    flags: hb_buffer_serialize_flags_t,
+) -> c_uint;
+```
+
+Serializes whatever the buffer holds, dispatching on the content type:
+`HB_BUFFER_CONTENT_TYPE_GLYPHS` goes to `hb_buffer_serialize_glyphs`,
+`HB_BUFFER_CONTENT_TYPE_UNICODE` to `hb_buffer_serialize_unicode`, and an
+invalid content type to an internal fallback that emits an empty
+representation.
+
+**Returns** — the number of items serialized.
+
+**Notes** — since HarfBuzz 2.7.3. This is the one to use when you do not know,
+or do not want to care, whether the buffer has been shaped yet. Because it never
+asserts on content type, it is also the safe choice inside a debugger or a
+logging helper.
+
+#### `hb_buffer_deserialize_glyphs`
+
+```c
+hb_bool_t hb_buffer_deserialize_glyphs (hb_buffer_t *buffer,
+                                        const char *buf,
+                                        int buf_len,
+                                        const char **end_ptr,
+                                        hb_font_t *font,
+                                        hb_buffer_serialize_format_t format);
+```
+
+```rust
+pub fn hb_buffer_deserialize_glyphs(
+    buffer: *mut hb_buffer_t,
+    buf: *const c_char,
+    buf_len: c_int,
+    end_ptr: *mut *const c_char,
+    font: *mut hb_font_t,
+    format: hb_buffer_serialize_format_t,
+) -> hb_bool_t;
+```
+
+Parses glyphs into `buffer` from the textual representation produced by
+`hb_buffer_serialize_glyphs`. The items are **appended** to whatever the buffer
+already holds.
+
+**Parameters**
+
+| Parameter | Meaning | Null allowed |
+| --- | --- | --- |
+| `buf` | The string to deserialize. | no |
+| `buf_len` | Its length, or `-1` if NUL-terminated. | — |
+| `end_ptr` | Out-parameter receiving a pointer to the character after the last one consumed. | yes |
+| `font` | Font used to resolve glyph names to glyph IDs. | yes — an empty font is used, which means names cannot be resolved |
+| `format` | The format of `buf`. | — |
+
+**Returns** — true if the full string was parsed, false otherwise. False is also
+returned for an empty `buf`, for an immutable buffer, and for an unsupported
+`format`; in those cases `*end_ptr` is set to `buf`.
+
+**Side effects** — asserts the buffer's content type is glyphs (an empty buffer
+qualifies), then sets it to `HB_BUFFER_CONTENT_TYPE_GLYPHS`.
+
+**Notes** — since HarfBuzz 0.9.7.
+
+#### `hb_buffer_deserialize_unicode`
+
+```c
+hb_bool_t hb_buffer_deserialize_unicode (hb_buffer_t *buffer,
+                                         const char *buf,
+                                         int buf_len,
+                                         const char **end_ptr,
+                                         hb_buffer_serialize_format_t format);
+```
+
+```rust
+pub fn hb_buffer_deserialize_unicode(
+    buffer: *mut hb_buffer_t,
+    buf: *const c_char,
+    buf_len: c_int,
+    end_ptr: *mut *const c_char,
+    format: hb_buffer_serialize_format_t,
+) -> hb_bool_t;
+```
+
+Parses Unicode text into `buffer` from the representation produced by
+`hb_buffer_serialize_unicode`, in the same manner as
+`hb_buffer_deserialize_glyphs` and with the same return convention. Asserts the
+content type is Unicode and sets it to `HB_BUFFER_CONTENT_TYPE_UNICODE`.
+
+**Notes** — since HarfBuzz 2.7.3.
+
+### Comparison
+
+#### `hb_buffer_diff`
+
+```c
+hb_buffer_diff_flags_t hb_buffer_diff (hb_buffer_t *buffer,
+                                       hb_buffer_t *reference,
+                                       hb_codepoint_t dottedcircle_glyph,
+                                       unsigned int position_fuzz);
+```
+
+```rust
+pub fn hb_buffer_diff(
+    buffer: *mut hb_buffer_t,
+    reference: *mut hb_buffer_t,
+    dottedcircle_glyph: hb_codepoint_t,
+    position_fuzz: c_uint,
+) -> hb_buffer_diff_flags_t;
+```
+
+Compares the contents of two buffers and reports the kinds of difference found.
+
+**Parameters**
+
+| Parameter | Meaning |
+| --- | --- |
+| `buffer` | The buffer under test. |
+| `reference` | The buffer to compare against. Only *this* one is scanned for `.notdef` and dotted circle. |
+| `dottedcircle_glyph` | The glyph ID of U+25CC DOTTED CIRCLE, or `(hb_codepoint_t) -1` (`HB_CODEPOINT_INVALID`). |
+| `position_fuzz` | The allowed absolute difference in position values before `HB_BUFFER_DIFF_FLAG_POSITION_MISMATCH` is reported. |
+
+**Returns** — a bitwise OR of `hb_buffer_diff_flags_t`;
+`HB_BUFFER_DIFF_FLAG_EQUAL` (zero) means no differences. Passing
+`HB_CODEPOINT_INVALID` for `dottedcircle_glyph` suppresses
+`HB_BUFFER_DIFF_FLAG_DOTTED_CIRCLE_PRESENT` and
+`HB_BUFFER_DIFF_FLAG_NOTDEF_PRESENT` entirely, which is what most callers who
+only want to compare two buffers should do.
+
+Comparison proceeds in stages: a content-type mismatch (reported only when both
+buffers are non-empty) is returned alone; a length mismatch skips the per-glyph
+comparison but still scans the reference for the two special glyphs; equal
+lengths are compared glyph by glyph with each differing aspect reported.
+
+**Notes** — since HarfBuzz 1.5.0. Neither buffer is modified despite the
+non-`const` parameters.
+
+### Tracing
+
+#### `hb_buffer_set_message_func`
+
+```c
+void hb_buffer_set_message_func (hb_buffer_t *buffer,
+                                 hb_buffer_message_func_t func,
+                                 void *user_data, hb_destroy_func_t destroy);
+```
+
+```rust
+pub fn hb_buffer_set_message_func(
+    buffer: *mut hb_buffer_t,
+    func: hb_buffer_message_func_t,
+    user_data: *mut c_void,
+    destroy: hb_destroy_func_t,
+);
+```
+
+Installs the `hb_buffer_message_func_t` implementation for this buffer. The
+callback is then invoked at each step of shaping with a message describing the
+step, and its return value decides whether the step runs.
+
+**Parameters**
+
+| Parameter | Meaning | Null allowed |
+| --- | --- | --- |
+| `func` | The callback. Passing null (`None`) clears any installed callback and its user data. | yes |
+| `user_data` | Data passed to `func`. | yes |
+| `destroy` | Called with `user_data` when it is no longer needed — when the buffer is destroyed, or when the callback is replaced. | yes |
+
+**Ownership** — the callee assumes ownership of `user_data` unconditionally:
+if the buffer is immutable, or if the call happens from *inside* a message
+callback, the function calls `destroy(user_data)` immediately and returns
+without installing anything. Any previously installed `destroy` is invoked
+before the new callback is stored.
+
+**Notes** — since HarfBuzz 1.1.3. Compiled out entirely when HarfBuzz is built
+with `HB_NO_BUFFER_MESSAGE`, in which case the symbol does not exist. Inside the
+callback, `hb_buffer_get_glyph_positions` may return null (see above).
+
+#### `hb_buffer_changed`
+
+```c
+void hb_buffer_changed (hb_buffer_t *buffer);
+```
+
+```rust
+pub fn hb_buffer_changed(buffer: *mut hb_buffer_t);
+```
+
+Called by a message callback *after* it has modified the buffer's glyph indices,
+to update HarfBuzz's internal caches (the shaping digest that shaping uses to
+skip lookups).
+
+**Notes** — since HarfBuzz 13.0.0. Does nothing when called from outside a
+message callback, so it is safe but useless elsewhere.

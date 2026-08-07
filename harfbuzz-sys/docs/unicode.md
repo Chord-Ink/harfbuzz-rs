@@ -378,8 +378,541 @@ pub type hb_unicode_decompose_func_t = Option<
 
 Should decompose an input code point by canonical equivalence, writing the two
 resulting code points through the `a` and `b` out-parameters if successful, and
-returning an `hb_bool_t`. Exactly two outputs — a canonical decomposition
-mapping of length one is expressed as `a` = the singleton and `b` = 0 by
-convention in HarfBuzz's own UCD implementation; the header does not specify
-this, so if you write your own, match what the normalizer expects by mirroring
-the built-in behaviour. Leave both out-parameters alone when returning false.
+returning an `hb_bool_t`. Exactly two outputs, always. The header does not say
+how to express a *singleton* canonical decomposition, but the bundled
+implementation in `hb-ucd.cc` sets `*a` to the single code point and `*b` to
+`0`, and HarfBuzz's normalizer is written against that behaviour — match it.
+Leave both out-parameters alone when returning false.
+
+## Functions
+
+### Obtaining a structure
+
+#### `hb_unicode_funcs_get_default`
+
+```c
+hb_unicode_funcs_t *hb_unicode_funcs_get_default (void);
+```
+
+```rust
+pub fn hb_unicode_funcs_get_default() -> *mut hb_unicode_funcs_t;
+```
+
+Fetches a pointer to the default Unicode-functions structure — the one used
+when no functions are explicitly set on an `hb_buffer_t`.
+
+**Returns** — never null. Which implementation you get is decided at build
+time, in this order:
+
+1. HarfBuzz's own bundled UCD tables (`hb_ucd_get_unicode_funcs()`), unless
+   `HB_NO_UCD` or `HB_NO_UNICODE_FUNCS` is defined.
+2. GLib (`hb_glib_get_unicode_funcs()`), if built with `HAVE_GLIB`.
+3. ICU (`hb_icu_get_unicode_funcs()`), if built with `HAVE_ICU` and
+   `HAVE_ICU_BUILTIN`.
+4. The empty structure, only in a `HB_NO_UNICODE_FUNCS` build. Any other
+   configuration that reaches this point is a compile error upstream
+   ("Could not find any Unicode functions implementation, you have to provide
+   your own").
+
+**Ownership** — upstream annotates the return `(transfer none)`. The caller does
+**not** own a reference: this is a process-wide singleton owned by HarfBuzz.
+Do not destroy it. If you want to keep it beyond the immediate call, take your
+own reference with `hb_unicode_funcs_reference()` and match it with a destroy.
+
+**Notes** — Since HarfBuzz 0.9.2. Treat it as immutable: it may already have
+been frozen by having been used as a parent, and in any case mutating a
+process-wide singleton is never what you want. Use it as a *parent* instead.
+
+#### `hb_unicode_funcs_create`
+
+```c
+hb_unicode_funcs_t *hb_unicode_funcs_create (hb_unicode_funcs_t *parent);
+```
+
+```rust
+pub fn hb_unicode_funcs_create(parent: *mut hb_unicode_funcs_t) -> *mut hb_unicode_funcs_t;
+```
+
+Creates a new `hb_unicode_funcs_t` structure of Unicode functions, with a
+reference count of one.
+
+**Parameters**
+
+| Parameter | Meaning |
+| --- | --- |
+| `parent` | Upstream annotates this `(nullable)`. Null is replaced by `hb_unicode_funcs_get_empty()`, so the structure always has a parent. |
+
+**Returns** — the new structure, `(transfer full)`. **Never null**: on allocation
+failure it returns the singleton empty structure instead, so the only way to
+detect failure is to compare against `hb_unicode_funcs_get_empty()`.
+
+**Ownership** — the caller owns the returned reference and must release it with
+`hb_unicode_funcs_destroy()`. The call takes its own reference on `parent`,
+released when the child is destroyed, so the parent outlives the child.
+
+**Side effects** — `parent` is made **immutable** by this call, permanently.
+There is no way to undo that, and creating a child is therefore a one-way door
+for the parent.
+
+**Inheritance is a snapshot, not a delegation.** The implementation copies the
+parent's entire function table and its `user_data` table into the child at
+creation time (it deliberately does *not* copy the destroy notifiers, since the
+parent still owns those). So a method you never set on the child calls the
+parent's function pointer directly — there is no per-call chain walk, and
+because the parent is now immutable it can never change underneath you.
+
+**Notes** — Since HarfBuzz 0.9.2.
+
+#### `hb_unicode_funcs_get_empty`
+
+```c
+hb_unicode_funcs_t *hb_unicode_funcs_get_empty (void);
+```
+
+```rust
+pub fn hb_unicode_funcs_get_empty() -> *mut hb_unicode_funcs_t;
+```
+
+Fetches the singleton empty Unicode-functions structure. Never null.
+
+Its six methods are inert stubs with fixed answers:
+
+| Method | Stub result |
+| --- | --- |
+| general category | `HB_UNICODE_GENERAL_CATEGORY_OTHER_LETTER` (`Lo`) |
+| combining class | `HB_UNICODE_COMBINING_CLASS_NOT_REORDERED` (0) |
+| mirroring | the input code point, unchanged |
+| script | `HB_SCRIPT_UNKNOWN` (`Zzzz`) |
+| compose | always `false` |
+| decompose | always `false` |
+
+Its `parent` pointer is null, so `hb_unicode_funcs_get_parent()` on it returns
+itself.
+
+**Ownership** — upstream annotates the return `(transfer full)`, so the
+conventional thing is to treat it like any other structure and destroy it when
+done; HarfBuzz's shared null objects are inert, so referencing and destroying
+them are cheap no-ops.
+
+**Notes** — Since HarfBuzz 0.9.2. This is also the value returned by
+`hb_unicode_funcs_create()` on allocation failure, and by
+`hb_unicode_funcs_get_default()` in a `HB_NO_UNICODE_FUNCS` build.
+
+### Reference counting
+
+#### `hb_unicode_funcs_reference`
+
+```c
+hb_unicode_funcs_t *hb_unicode_funcs_reference (hb_unicode_funcs_t *ufuncs);
+```
+
+```rust
+pub fn hb_unicode_funcs_reference(ufuncs: *mut hb_unicode_funcs_t) -> *mut hb_unicode_funcs_t;
+```
+
+Increases the reference count on a Unicode-functions structure and returns the
+same pointer, which makes it convenient to use inline when handing the structure
+to something that will take ownership. Every call must be matched by a
+`hb_unicode_funcs_destroy()`.
+
+**Notes** — Since HarfBuzz 0.9.2. Marked `(skip)` for language bindings
+upstream. Reference counts are atomic in a normally configured build.
+
+#### `hb_unicode_funcs_destroy`
+
+```c
+void hb_unicode_funcs_destroy (hb_unicode_funcs_t *ufuncs);
+```
+
+```rust
+pub fn hb_unicode_funcs_destroy(ufuncs: *mut hb_unicode_funcs_t);
+```
+
+Decreases the reference count on a Unicode-functions structure. When the count
+reaches zero the structure is destroyed and all of its memory freed. On the way
+down it invokes each installed callback's `destroy` notifier on that callback's
+`user_data`, then releases the reference it holds on its parent — which can
+cascade.
+
+**Returns** — nothing. There is no way to observe whether the object actually
+went away.
+
+**Notes** — Since HarfBuzz 0.9.2. Marked `(skip)` upstream. Tolerates the shared
+singletons, which are inert.
+
+### User data
+
+#### `hb_unicode_funcs_set_user_data`
+
+```c
+hb_bool_t hb_unicode_funcs_set_user_data (hb_unicode_funcs_t *ufuncs,
+                                          hb_user_data_key_t *key,
+                                          void *              data,
+                                          hb_destroy_func_t   destroy,
+                                          hb_bool_t           replace);
+```
+
+```rust
+pub fn hb_unicode_funcs_set_user_data(
+    ufuncs: *mut hb_unicode_funcs_t,
+    key: *mut hb_user_data_key_t,
+    data: *mut c_void,
+    destroy: hb_destroy_func_t,
+    replace: hb_bool_t,
+) -> hb_bool_t;
+```
+
+Attaches a key/data pair to the structure. HarfBuzz uses the *address* of `key`,
+not its contents, so the key object must outlive the structure — a `static` is
+the usual choice. `destroy` may be null; when non-null it is called with `data`
+when the structure is destroyed or when the entry is replaced. `replace` selects
+whether an existing entry stored under the same key is overwritten.
+
+**Returns** — true on success, false otherwise (allocation failure, or a
+non-replace call against an existing key).
+
+**Notes** — Since HarfBuzz 0.9.2. This is orthogonal to the per-callback
+`user_data` passed to the setters; do not confuse the two.
+
+#### `hb_unicode_funcs_get_user_data`
+
+```c
+void *hb_unicode_funcs_get_user_data (const hb_unicode_funcs_t *ufuncs,
+                                      hb_user_data_key_t       *key);
+```
+
+```rust
+pub fn hb_unicode_funcs_get_user_data(
+    ufuncs: *const hb_unicode_funcs_t,
+    key: *mut hb_user_data_key_t,
+) -> *mut c_void;
+```
+
+Fetches the data previously attached under `key`. Note the `const` structure
+parameter. Ownership is not transferred (`(transfer none)`): the returned
+pointer belongs to whoever stored it and must not be freed by the caller.
+Returns null when no entry is present for that key.
+
+**Notes** — Since HarfBuzz 0.9.2.
+
+### Immutability
+
+#### `hb_unicode_funcs_make_immutable`
+
+```c
+void hb_unicode_funcs_make_immutable (hb_unicode_funcs_t *ufuncs);
+```
+
+```rust
+pub fn hb_unicode_funcs_make_immutable(ufuncs: *mut hb_unicode_funcs_t);
+```
+
+Makes the specified Unicode-functions structure immutable. **One-way** — there
+is no `make_mutable`. Afterwards every `hb_unicode_funcs_set_*_func()` call
+silently does nothing except run the `destroy` notifier on the `user_data` it
+was handed (so nothing leaks, and nothing changes).
+
+Applied implicitly by `hb_unicode_funcs_create()` to its `parent` argument.
+
+**Notes** — Since HarfBuzz 0.9.2. Idempotent. Freeze a structure before sharing
+it across threads; that is the discipline the whole object model is built for.
+
+#### `hb_unicode_funcs_is_immutable`
+
+```c
+hb_bool_t hb_unicode_funcs_is_immutable (hb_unicode_funcs_t *ufuncs);
+```
+
+```rust
+pub fn hb_unicode_funcs_is_immutable(ufuncs: *mut hb_unicode_funcs_t) -> hb_bool_t;
+```
+
+Tests whether the structure is immutable; true if it is. Since HarfBuzz 0.9.2.
+This is the *only* way to find out that a setter is going to be a no-op, since
+the setters themselves return `void`.
+
+### Inheritance
+
+#### `hb_unicode_funcs_get_parent`
+
+```c
+hb_unicode_funcs_t *hb_unicode_funcs_get_parent (hb_unicode_funcs_t *ufuncs);
+```
+
+```rust
+pub fn hb_unicode_funcs_get_parent(ufuncs: *mut hb_unicode_funcs_t) -> *mut hb_unicode_funcs_t;
+```
+
+Fetches the parent of the structure.
+
+**Returns** — **never null**: a structure with no parent (the empty singleton)
+reports `hb_unicode_funcs_get_empty()`.
+
+**Ownership** — the child keeps owning the returned reference. This is a borrow,
+not a new reference; do not destroy it unless you call
+`hb_unicode_funcs_reference()` on it first.
+
+**Notes** — Since HarfBuzz 0.9.2. The parent is guaranteed immutable, because
+`hb_unicode_funcs_create()` froze it.
+
+### Installing callbacks
+
+All six setters have the same shape, the same ownership rules, and the same
+failure mode. They are documented once here and then listed individually.
+
+```c
+void hb_unicode_funcs_set_<name>_func (hb_unicode_funcs_t     *ufuncs,
+                                       hb_unicode_<name>_func_t func,
+                                       void                   *user_data,
+                                       hb_destroy_func_t       destroy);
+```
+
+**Parameters**
+
+| Parameter | Meaning |
+| --- | --- |
+| `ufuncs` | The structure to modify. Nullability is unspecified in the header; the implementation dereferences it, so treat null as forbidden. |
+| `func` | The callback. Upstream annotates it `(closure user_data) (destroy destroy) (scope notified)`. Passing null (`None` in Rust) is legal and **restores the parent's implementation** — see below. |
+| `user_data` | Opaque pointer handed back to `func` on every call. |
+| `destroy` | Upstream annotates it `(nullable)`. Called with `user_data` when the callback is replaced or the structure is destroyed. |
+
+**Returns** — nothing. There is no success/failure signal.
+
+**Ownership** — the callee takes ownership of `user_data` unconditionally, in
+every path:
+
+- Normal case: `destroy(user_data)` runs when the method is replaced or the
+  structure is destroyed.
+- `ufuncs` is immutable: the setter runs `destroy(user_data)` immediately and
+  returns without changing anything.
+- `func` is null: the setter runs `destroy(user_data)` immediately, then sets
+  the method back to the parent's function pointer *and the parent's*
+  `user_data`, with no destroy notifier of its own.
+
+So a Rust wrapper that leaks a `Box` into `user_data` before the call is
+correct in all three cases; one that frees the `Box` afterwards is a double
+free.
+
+**Notes** — all six are Since HarfBuzz 0.9.2.
+
+#### `hb_unicode_funcs_set_general_category_func`
+
+```rust
+pub fn hb_unicode_funcs_set_general_category_func(
+    ufuncs: *mut hb_unicode_funcs_t,
+    func: hb_unicode_general_category_func_t,
+    user_data: *mut c_void,
+    destroy: hb_destroy_func_t,
+);
+```
+
+Sets the implementation function for `hb_unicode_general_category_func_t`.
+
+#### `hb_unicode_funcs_set_combining_class_func`
+
+```rust
+pub fn hb_unicode_funcs_set_combining_class_func(
+    ufuncs: *mut hb_unicode_funcs_t,
+    func: hb_unicode_combining_class_func_t,
+    user_data: *mut c_void,
+    destroy: hb_destroy_func_t,
+);
+```
+
+Sets the implementation function for `hb_unicode_combining_class_func_t`.
+
+#### `hb_unicode_funcs_set_mirroring_func`
+
+```rust
+pub fn hb_unicode_funcs_set_mirroring_func(
+    ufuncs: *mut hb_unicode_funcs_t,
+    func: hb_unicode_mirroring_func_t,
+    user_data: *mut c_void,
+    destroy: hb_destroy_func_t,
+);
+```
+
+Sets the implementation function for `hb_unicode_mirroring_func_t`.
+
+#### `hb_unicode_funcs_set_script_func`
+
+```rust
+pub fn hb_unicode_funcs_set_script_func(
+    ufuncs: *mut hb_unicode_funcs_t,
+    func: hb_unicode_script_func_t,
+    user_data: *mut c_void,
+    destroy: hb_destroy_func_t,
+);
+```
+
+Sets the implementation function for `hb_unicode_script_func_t`.
+
+#### `hb_unicode_funcs_set_compose_func`
+
+```rust
+pub fn hb_unicode_funcs_set_compose_func(
+    ufuncs: *mut hb_unicode_funcs_t,
+    func: hb_unicode_compose_func_t,
+    user_data: *mut c_void,
+    destroy: hb_destroy_func_t,
+);
+```
+
+Sets the implementation function for `hb_unicode_compose_func_t`.
+
+#### `hb_unicode_funcs_set_decompose_func`
+
+```rust
+pub fn hb_unicode_funcs_set_decompose_func(
+    ufuncs: *mut hb_unicode_funcs_t,
+    func: hb_unicode_decompose_func_t,
+    user_data: *mut c_void,
+    destroy: hb_destroy_func_t,
+);
+```
+
+Sets the implementation function for `hb_unicode_decompose_func_t`.
+
+### Querying properties
+
+These six dispatch straight through the structure's vtable. None of them
+validates `unicode` against `HB_UNICODE_MAX`; that is the callback's problem.
+None of them tolerates a null `ufuncs`.
+
+#### `hb_unicode_general_category`
+
+```c
+hb_unicode_general_category_t hb_unicode_general_category (hb_unicode_funcs_t *ufuncs,
+                                                           hb_codepoint_t unicode);
+```
+
+```rust
+pub fn hb_unicode_general_category(
+    ufuncs: *mut hb_unicode_funcs_t,
+    unicode: hb_codepoint_t,
+) -> hb_unicode_general_category_t;
+```
+
+Retrieves the General Category (`gc`) property of code point `unicode`. Returns
+the `hb_unicode_general_category_t`; there is no error value. Since HarfBuzz
+0.9.2.
+
+#### `hb_unicode_combining_class`
+
+```c
+hb_unicode_combining_class_t hb_unicode_combining_class (hb_unicode_funcs_t *ufuncs,
+                                                         hb_codepoint_t unicode);
+```
+
+```rust
+pub fn hb_unicode_combining_class(
+    ufuncs: *mut hb_unicode_funcs_t,
+    unicode: hb_codepoint_t,
+) -> hb_unicode_combining_class_t;
+```
+
+Retrieves the Canonical Combining Class (`ccc`) property of code point
+`unicode`. **The result may be any value in 0..=254**, not only the named
+constants — the header says so in a `<note>`. Since HarfBuzz 0.9.2.
+
+#### `hb_unicode_mirroring`
+
+```c
+hb_codepoint_t hb_unicode_mirroring (hb_unicode_funcs_t *ufuncs,
+                                     hb_codepoint_t unicode);
+```
+
+```rust
+pub fn hb_unicode_mirroring(
+    ufuncs: *mut hb_unicode_funcs_t,
+    unicode: hb_codepoint_t,
+) -> hb_codepoint_t;
+```
+
+Retrieves the Bi-directional Mirroring Glyph code point defined for `unicode`.
+Code points with no mirroring glyph come back **unchanged**, so `result ==
+unicode` is the "no mirror" signal, not zero. Since HarfBuzz 0.9.2.
+
+#### `hb_unicode_script`
+
+```c
+hb_script_t hb_unicode_script (hb_unicode_funcs_t *ufuncs,
+                               hb_codepoint_t unicode);
+```
+
+```rust
+pub fn hb_unicode_script(
+    ufuncs: *mut hb_unicode_funcs_t,
+    unicode: hb_codepoint_t,
+) -> hb_script_t;
+```
+
+Retrieves the `hb_script_t` script to which code point `unicode` belongs.
+Unassigned, private-use, noncharacter, and surrogate code points give
+`HB_SCRIPT_UNKNOWN`; a newer HarfBuzz may return a script value your build has
+no constant for, so do not treat the result as a closed set. Since HarfBuzz
+0.9.2.
+
+#### `hb_unicode_compose`
+
+```c
+hb_bool_t hb_unicode_compose (hb_unicode_funcs_t *ufuncs,
+                              hb_codepoint_t      a,
+                              hb_codepoint_t      b,
+                              hb_codepoint_t     *ab);
+```
+
+```rust
+pub fn hb_unicode_compose(
+    ufuncs: *mut hb_unicode_funcs_t,
+    a: hb_codepoint_t,
+    b: hb_codepoint_t,
+    ab: *mut hb_codepoint_t,
+) -> hb_bool_t;
+```
+
+Fetches the composition of a sequence of two Unicode code points, by calling the
+composition function of `ufuncs`.
+
+**Parameters** — `a` and `b` are the two code points to compose; `ab` is an
+out-parameter, annotated `(out)`. The header does not mark it nullable and the
+built-in implementations write through it unconditionally on success, so pass a
+real pointer.
+
+**Returns** — true if `a` and `b` composed, false otherwise. `*ab` is only
+meaningful when the call returns true; on false it is left untouched, so
+initialise it or ignore it.
+
+**Notes** — Since HarfBuzz 0.9.2. Canonical composition only.
+
+#### `hb_unicode_decompose`
+
+```c
+hb_bool_t hb_unicode_decompose (hb_unicode_funcs_t *ufuncs,
+                                hb_codepoint_t      ab,
+                                hb_codepoint_t     *a,
+                                hb_codepoint_t     *b);
+```
+
+```rust
+pub fn hb_unicode_decompose(
+    ufuncs: *mut hb_unicode_funcs_t,
+    ab: hb_codepoint_t,
+    a: *mut hb_codepoint_t,
+    b: *mut hb_codepoint_t,
+) -> hb_bool_t;
+```
+
+Fetches the decomposition of a Unicode code point, by calling the decomposition
+function of `ufuncs`.
+
+**Parameters** — `ab` is the code point to decompose; `a` and `b` are
+out-parameters, both annotated `(out)` and neither marked nullable.
+
+**Returns** — true if `ab` was decomposed, false otherwise. `*a` and `*b` are
+only meaningful when the call returns true. With the bundled UCD implementation
+a singleton decomposition sets `*b` to `0`.
+
+**Notes** — Since HarfBuzz 0.9.2. Canonical decomposition only; the
+compatibility variant, `hb_unicode_decompose_compatibility()`, was deprecated in
+HarfBuzz 2.0.0 and lives in `hb-deprecated.h`.
