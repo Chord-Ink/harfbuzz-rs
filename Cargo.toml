@@ -21,7 +21,7 @@ rust-version.workspace = true
 harfbuzz-sys = { path = "harfbuzz-sys", version = "0.1.0", default-features = false }
 
 [features]
-default = ["subset", "debug"]
+default = []
 
 # Build HarfBuzz with debug information and frame pointers.
 debug = ["harfbuzz-sys/debug"]
@@ -46,18 +46,3 @@ zlib = ["harfbuzz-sys/zlib"]
 
 # HarfBuzz APIs that upstream has not committed to yet.
 experimental = ["harfbuzz-sys/experimental"]
-
-[profile.release]
-# Cross-language LTO: HarfBuzz is compiled to LLVM bitcode by build.rs, so the
-# final link is where C++ and Rust get optimized together.
-lto = true
-codegen-units = 1
-panic = "abort"
-# HarfBuzz is built with -Oz; matching that on the Rust side keeps the whole
-# image small. Debug symbols are deliberately retained (see .cargo/config.toml).
-opt-level = "z"
-strip = false
-debug = true
-
-[profile.dev]
-debug = true

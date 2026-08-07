@@ -4,7 +4,7 @@
 use core::ffi::{c_int, c_void};
 
 use crate::{
-    hb_bool_t, hb_codepoint_t, hb_destroy_func_t, hb_script_t, hb_user_data_key_t, opaque_handle,
+    hb_bool_t, hb_codepoint_t, hb_destroy_func_t, hb_script_t, hb_user_data_key_t,
 };
 
 /// Maximum valid Unicode code point.

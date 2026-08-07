@@ -5,7 +5,6 @@
 
 use core::ffi::{c_char, c_uint, c_void};
 
-use crate::opaque_handle;
 use crate::{
     hb_blob_t, hb_bool_t, hb_codepoint_t, hb_destroy_func_t, hb_map_t, hb_set_t, hb_tag_t,
     hb_user_data_key_t,

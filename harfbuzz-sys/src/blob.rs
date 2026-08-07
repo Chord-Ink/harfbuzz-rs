@@ -5,7 +5,6 @@
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 
-use crate::opaque_handle;
 use crate::{hb_bool_t, hb_destroy_func_t, hb_user_data_key_t};
 
 /// The memory modes available to client programs when wrapping data in a blob.

@@ -1,75 +1,15 @@
-//! Build script for `harfbuzz-sys`: compiles the vendored HarfBuzz sources into
-//! a static archive and tells Cargo how to link it.
-//!
-//! # What gets compiled
-//!
-//! HarfBuzz is a C++ project — upstream's `meson.build` declares
-//! `project('harfbuzz', ['c', 'cpp'])` with `cpp_std=c++11`, and `src/` holds
-//! 137 `.cc` files against 50 `.h`. It ships an *amalgamation*,
-//! `src/harfbuzz-world.cc`, which `#include`s every other translation unit
-//! behind `HB_HAS_*` guards. Compiling that one file builds the whole library,
-//! and it makes the Cargo features here map one-for-one onto upstream's build
-//! switches.
-//!
-//! # Compiler selection
-//!
-//! Everything goes through the `cc` crate, so the usual conventions apply and
-//! nothing is hard-coded. Because the build is C++, the compiler comes from
-//! **`CXX`** (or `CXX_<target>`), not `CC`:
-//!
-//! ```sh
-//! CXX=/path/to/llvm/bin/clang++ cargo build
-//! ```
-//!
-//! # Cross-language LTO
-//!
-//! LTO is not something this crate can decide on its own. Cross-language LTO
-//! only happens when the *consumer* passes `-Clinker-plugin-lto`, which makes
-//! `rustc` emit LLVM bitcode instead of machine code. This script looks for
-//! that flag in `CARGO_ENCODED_RUSTFLAGS` and, when it is present, compiles
-//! HarfBuzz to bitcode too by adding `-flto`, so the linker can optimize across
-//! the language boundary.
-//!
-//! Two conditions gate it:
-//!
-//! * **The compiler must be genuine LLVM Clang.** GCC's LTO objects use a
-//!   different format entirely, and Apple Clang's bitcode is tied to the LLVM
-//!   inside Xcode rather than the one `rustc` embeds. In either case this
-//!   script warns and compiles normally.
-//! * **Without `-Clinker-plugin-lto` there is no `-flto`.** Emitting bitcode
-//!   that the consumer's linker was never told to expect turns a working build
-//!   into a link failure, and a build script cannot fix a downstream link:
-//!   Cargo does not propagate `rustc-link-arg` to dependents.
-//!
-//! # Environment variables
-//!
-//! | Variable                     | Effect                                        |
-//! | ---------------------------- | --------------------------------------------- |
-//! | `CXX`, `CXXFLAGS`            | Compiler and extra flags (read by `cc`)        |
-//! | `AR`                         | Archiver (read by `cc`)                        |
-//! | `NM`                         | Symbol reader, for `tests/symbols.rs`          |
-//! | `CARGO_ENCODED_RUSTFLAGS`    | Inspected for `-Clinker-plugin-lto`            |
-//! | `MACOSX_DEPLOYMENT_TARGET`   | Minimum macOS version (read by `cc`)           |
-//! | `SDKROOT`                    | Apple SDK, when `CXX` is not Apple's clang     |
-//! | `PKG_CONFIG_PATH`            | Where to find optional system libraries        |
-//!
-//! `SDKROOT` deserves a word. Apple's own clang knows where the SDK is; a
-//! standalone LLVM clang does not, and fails on the first system header with
-//! `'inttypes.h' file not found`. Clang reads `SDKROOT` itself, so setting it
-//! alongside `CXX` is all that is needed — this script does not go looking.
-
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread;
+
+use pkg_config::Library;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    let hb_root = manifest_dir.join("harfbuzz");
-    let hb_src = hb_root.join("src");
+    let hb_src = manifest_dir.join("harfbuzz").join("src");
 
     rerun_directives(&manifest_dir, &hb_src);
 
@@ -85,51 +25,28 @@ fn main() {
     let features = Features::from_env();
     features.warn_about_size_profiles();
 
-    let mut build = base_build(&hb_src, &out_dir, &features);
-
-    // `get_compiler` resolves CXX, the target triple, and the sysroot, so it has
-    // to happen after the target-affecting settings are in place.
-    let compiler = build.get_compiler();
-    let kind = CompilerKind::detect(compiler.path());
-
-    if let Some(flag) = lto_flag(kind) {
-        build.flag(flag);
-
-        // With `-flto` the object file is LLVM bitcode, which carries no native
-        // symbol table. Only an LLVM-aware archiver can index it, and `cc`
-        // takes the archiver from `AR`, so that is where the choice belongs.
-        if env::var_os("AR").is_none() {
-            println!(
-                "cargo::warning=harfbuzz-sys: compiling to LLVM bitcode, but AR is unset. A \
-                 plain `ar` cannot index bitcode and produces an archive the linker reads as \
-                 empty. Set AR to the llvm-ar that ships with your CXX."
-            );
-        }
-    }
+    let build = configure(&hb_src, &out_dir, &features);
 
     // Probe the target the way upstream's meson build does, rather than
     // hard-coding a table of what each platform is assumed to provide.
-    let probes = Probe::run_all(&compiler, &out_dir);
+    let probes = Probe::run_all(&build.get_compiler(), &out_dir);
     fs::write(out_dir.join("config.h"), render_config_h(&probes, &features))
         .expect("write config.h");
 
-    // `compile` also emits the link-lib and link-search directives for us.
+    // `compile` also emits the link-lib and link-search directives for us;
+    // `pkg-config` emitted its own during `probe`.
     build.compile("harfbuzz");
 
-    emit_extra_link_directives(&features);
+    emit_framework_directives(&features);
     emit_test_env(&out_dir);
-    emit_metadata(&hb_src, kind);
+    println!("cargo::metadata=include={}", hb_src.display());
 }
-
-// ---------------------------------------------------------------------------
-// Cargo re-run rules
-// ---------------------------------------------------------------------------
 
 /// Tell Cargo the narrow set of inputs that can change what we produce.
 ///
 /// Pointing `rerun-if-changed` at the source *directory* is deliberate: Cargo
 /// walks it recursively, so moving the submodule to a different tag invalidates
-/// the build.
+/// the build. `cc` and `pkg-config` register their own environment variables.
 fn rerun_directives(manifest_dir: &Path, hb_src: &Path) {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed={}", hb_src.display());
@@ -137,21 +54,13 @@ fn rerun_directives(manifest_dir: &Path, hb_src: &Path) {
         "cargo::rerun-if-changed={}",
         manifest_dir.join("Cargo.toml").display()
     );
-
-    // `cc` already watches CXX and friends, but the LTO decision is ours and it
-    // reads the encoded rustflags.
-    println!("cargo::rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
-    println!("cargo::rerun-if-env-changed=RUSTFLAGS");
-    println!("cargo::rerun-if-env-changed=PKG_CONFIG_PATH");
 }
 
 // ---------------------------------------------------------------------------
 // The compile
 // ---------------------------------------------------------------------------
 
-/// Configure everything about the build that does not depend on knowing which
-/// compiler `cc` resolved.
-fn base_build(hb_src: &Path, out_dir: &Path, features: &Features) -> cc::Build {
+fn configure(hb_src: &Path, out_dir: &Path, features: &Features) -> cc::Build {
     let mut build = cc::Build::new();
 
     build
@@ -164,11 +73,7 @@ fn base_build(hb_src: &Path, out_dir: &Path, features: &Features) -> cc::Build {
 
     // ICU 75 and later need C++17 in their public headers; upstream's meson
     // build special-cases this the same way.
-    let needs_cxx17 = features
-        .icu
-        .as_ref()
-        .and_then(PkgConfig::major)
-        .is_some_and(|v| v >= 75);
+    let needs_cxx17 = features.icu.as_ref().is_some_and(|lib| major(lib) >= 75);
     build.std(if needs_cxx17 { "c++17" } else { "c++11" });
 
     // Matched to upstream's meson defaults. RTTI stays on when ICU is linked,
@@ -181,16 +86,16 @@ fn base_build(hb_src: &Path, out_dir: &Path, features: &Features) -> cc::Build {
     build.flag_if_supported("-fno-threadsafe-statics");
     build.flag_if_supported("-fvisibility-inlines-hidden");
 
-    // Size first, as requested. `-ffunction-sections`/`-fdata-sections` give
-    // the linker symbol-granularity dead stripping; rustc already passes
-    // `-Wl,-dead_strip` (Mach-O) and `--gc-sections` (ELF) by default, so there
-    // is nothing to add on the link side.
+    // Size first. `-ffunction-sections`/`-fdata-sections` give the linker
+    // symbol-granularity dead stripping; rustc already passes `-Wl,-dead_strip`
+    // (Mach-O) and `--gc-sections` (ELF), so there is nothing to add on the
+    // link side.
     build.opt_level_str("z");
     build.flag_if_supported("-ffunction-sections");
     build.flag_if_supported("-fdata-sections");
 
-    // The `debug` feature owns this, rather than Cargo's profile, so that a
-    // release build can still carry a debuggable HarfBuzz.
+    // The `debug` feature owns this, rather than Cargo's profile, so a release
+    // build can still carry a debuggable HarfBuzz.
     build.debug(features.debug);
     if features.debug {
         // Frame pointers keep stacks walkable for profilers that do not parse
@@ -234,139 +139,31 @@ fn base_build(hb_src: &Path, out_dir: &Path, features: &Features) -> cc::Build {
         }
     }
 
-    for pkg in features.pkg_configs() {
-        for flag in &pkg.cflags {
-            build.flag(flag);
-        }
+    for lib in features.libraries() {
+        build.includes(&lib.include_paths);
     }
 
     build
 }
 
 // ---------------------------------------------------------------------------
-// LTO
-// ---------------------------------------------------------------------------
-
-/// Which compiler `cc` resolved, to the precision the LTO decision needs.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum CompilerKind {
-    /// Upstream LLVM Clang.
-    Clang,
-    /// Apple's fork, shipped with Xcode. Its bitcode belongs to the LLVM inside
-    /// Xcode, which is not the one `rustc` embeds.
-    AppleClang,
-    /// GCC, or anything claiming to be it.
-    Gnu,
-    /// Anything unrecognised.
-    Other,
-}
-
-impl CompilerKind {
-    /// Read the compiler's own version banner.
-    ///
-    /// Apple Clang identifies itself as `Apple clang version 17.0.0 (...)`,
-    /// upstream as `clang version 22.1.2 (https://github.com/llvm/...)`. There
-    /// is no flag that distinguishes them, so the banner is what we have.
-    fn detect(path: &Path) -> Self {
-        let Ok(output) = Command::new(path).arg("--version").output() else {
-            return Self::Other;
-        };
-
-        let banner = String::from_utf8_lossy(&output.stdout).to_lowercase();
-
-        if banner.contains("apple clang") || banner.contains("apple llvm") {
-            Self::AppleClang
-        } else if banner.contains("clang version") {
-            Self::Clang
-        } else if banner.contains("free software foundation") || banner.contains("gcc") {
-            Self::Gnu
-        } else {
-            Self::Other
-        }
-    }
-
-    fn describe(self) -> &'static str {
-        match self {
-            Self::Clang => "LLVM Clang",
-            Self::AppleClang => "Apple Clang",
-            Self::Gnu => "GCC",
-            Self::Other => "an unrecognised compiler",
-        }
-    }
-}
-
-/// Decide whether to compile HarfBuzz to LLVM bitcode.
-///
-/// Cross-language LTO is driven from the consumer's side: `-Clinker-plugin-lto`
-/// is what makes `rustc` emit bitcode rather than machine code, and only then
-/// does it help for the C++ half to be bitcode too. Without that flag, emitting
-/// bitcode here would hand the consumer's linker something it was not set up to
-/// read.
-fn lto_flag(kind: CompilerKind) -> Option<&'static str> {
-    if !consumer_wants_cross_language_lto() {
-        return None;
-    }
-
-    if kind == CompilerKind::Clang {
-        return Some("-flto");
-    }
-
-    println!(
-        "cargo::warning=harfbuzz-sys: -Clinker-plugin-lto is set, but the C++ compiler is {}. \
-         Cross-language LTO needs the same LLVM that rustc embeds, so HarfBuzz is being compiled \
-         without -flto. Set CXX to an LLVM clang++ whose version matches `rustc -vV`.",
-        kind.describe()
-    );
-
-    None
-}
-
-/// Look for `-Clinker-plugin-lto` in the flags Cargo is passing to `rustc`.
-///
-/// `CARGO_ENCODED_RUSTFLAGS` is the authoritative form — it is `\x1f`-separated
-/// so that flags containing spaces survive intact. `RUSTFLAGS` is checked as a
-/// fallback for the rare setup that sets it without Cargo re-encoding it.
-fn consumer_wants_cross_language_lto() -> bool {
-    let encoded = env::var("CARGO_ENCODED_RUSTFLAGS")
-        .map(|flags| flags.split('\u{1f}').any(mentions_linker_plugin_lto))
-        .unwrap_or(false);
-
-    encoded
-        || env::var("RUSTFLAGS")
-            .map(|flags| flags.split_whitespace().any(mentions_linker_plugin_lto))
-            .unwrap_or(false)
-}
-
-/// Match every spelling `rustc` accepts: `-Clinker-plugin-lto`,
-/// `-C linker-plugin-lto` (which arrives as two separate encoded flags),
-/// `-Clinker-plugin-lto=yes`, and `--codegen linker-plugin-lto`.
-///
-/// A bare `linker-plugin-lto` is matched too, because that is what the value
-/// half of a split `-C linker-plugin-lto` looks like.
-fn mentions_linker_plugin_lto(flag: &str) -> bool {
-    flag.trim_start_matches(['-', 'C'])
-        .trim_start_matches("-codegen")
-        .trim_start()
-        .starts_with("linker-plugin-lto")
-}
-
-// ---------------------------------------------------------------------------
 // Features
 // ---------------------------------------------------------------------------
 
-/// The enabled Cargo features, resolved against what the target can provide.
+/// The enabled Cargo features, with every optional system library already
+/// located.
 struct Features {
     subset: bool,
     raster: bool,
     vector: bool,
     gpu: bool,
     coretext: bool,
-    freetype: Option<PkgConfig>,
-    graphite2: Option<PkgConfig>,
-    icu: Option<PkgConfig>,
-    glib: Option<PkgConfig>,
-    png: Option<PkgConfig>,
-    zlib: Option<PkgConfig>,
+    freetype: Option<Library>,
+    graphite2: Option<Library>,
+    icu: Option<Library>,
+    glib: Option<Library>,
+    png: Option<Library>,
+    zlib: Option<Library>,
     experimental: bool,
     debug: bool,
     mini: bool,
@@ -396,12 +193,12 @@ impl Features {
             vector: on("VECTOR"),
             gpu: on("GPU"),
             coretext,
-            freetype: PkgConfig::require(on("FREETYPE"), "freetype2"),
-            graphite2: PkgConfig::require(on("GRAPHITE2"), "graphite2"),
-            icu: PkgConfig::require(on("ICU"), "icu-uc"),
-            glib: PkgConfig::require(on("GLIB"), "glib-2.0"),
-            png: PkgConfig::require(on("PNG"), "libpng"),
-            zlib: PkgConfig::require(on("ZLIB"), "zlib"),
+            freetype: probe(on("FREETYPE"), "freetype2"),
+            graphite2: probe(on("GRAPHITE2"), "graphite2"),
+            icu: probe(on("ICU"), "icu-uc"),
+            glib: probe(on("GLIB"), "glib-2.0"),
+            png: probe(on("PNG"), "libpng"),
+            zlib: probe(on("ZLIB"), "zlib"),
             experimental: on("EXPERIMENTAL"),
             debug: on("DEBUG"),
             mini: on("MINI"),
@@ -426,8 +223,7 @@ impl Features {
         }
     }
 
-    /// Every external library we located, in link order.
-    fn pkg_configs(&self) -> impl Iterator<Item = &PkgConfig> {
+    fn libraries(&self) -> impl Iterator<Item = &Library> {
         [
             self.freetype.as_ref(),
             self.graphite2.as_ref(),
@@ -441,64 +237,33 @@ impl Features {
     }
 }
 
-// ---------------------------------------------------------------------------
-// pkg-config
-// ---------------------------------------------------------------------------
+/// Locate `name` when `enabled`.
+///
+/// `probe` emits the link directives itself, so the caller only needs the
+/// include paths. Failure is fatal on purpose: a feature the user explicitly
+/// asked for should never be silently dropped.
+fn probe(enabled: bool, name: &str) -> Option<Library> {
+    if !enabled {
+        return None;
+    }
 
-/// The compile and link flags for one system library, as reported by
-/// `pkg-config`.
-struct PkgConfig {
-    name: String,
-    cflags: Vec<String>,
-    libs: Vec<String>,
-    modversion: Option<String>,
+    match pkg_config::Config::new().probe(name) {
+        Ok(library) => Some(library),
+        Err(err) => panic!(
+            "the requested feature needs the `{name}` library, which pkg-config could not \
+             find.\nInstall it, or point PKG_CONFIG_PATH at it.\n\n{err}"
+        ),
+    }
 }
 
-impl PkgConfig {
-    /// Look up `name` when `enabled`, panicking with an actionable message if
-    /// the library is missing. A feature the user explicitly asked for should
-    /// never be silently dropped.
-    fn require(enabled: bool, name: &str) -> Option<Self> {
-        if !enabled {
-            return None;
-        }
-
-        let query = |arg: &str| -> Option<Vec<String>> {
-            let out = Command::new("pkg-config").args([arg, name]).output().ok()?;
-            out.status.success().then(|| {
-                String::from_utf8_lossy(&out.stdout)
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect()
-            })
-        };
-
-        let cflags = query("--cflags").unwrap_or_else(|| {
-            panic!(
-                "the requested feature needs the `{name}` library, but `pkg-config --cflags \
-                 {name}` failed.\nInstall it, or point PKG_CONFIG_PATH at it."
-            )
-        });
-
-        let modversion = Command::new("pkg-config")
-            .args(["--modversion", name])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-
-        Some(Self {
-            name: name.to_string(),
-            cflags,
-            libs: query("--libs").unwrap_or_default(),
-            modversion,
-        })
-    }
-
-    /// The major version, used to apply version-dependent build rules.
-    fn major(&self) -> Option<u32> {
-        self.modversion.as_ref()?.split('.').next()?.parse().ok()
-    }
+/// The major version of a located library, or zero when it is unparsable.
+fn major(library: &Library) -> u32 {
+    library
+        .version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse().ok())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +351,7 @@ impl Probe {
 
             handles
                 .into_iter()
-                .map(|h| h.join().expect("probe thread panicked"))
+                .map(|handle| handle.join().expect("probe thread panicked"))
                 .collect()
         })
     }
@@ -608,7 +373,7 @@ fn compiles(compiler: &cc::Tool, scratch: &Path, name: &str, source: &str) -> bo
     cmd.args(["-x", "c", "-c", "-w"]);
     cmd.arg(&file).arg("-o").arg(&object);
 
-    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+    cmd.output().map(|out| out.status.success()).unwrap_or(false)
 }
 
 /// Render the `config.h` that HarfBuzz picks up via `-DHAVE_CONFIG_H`.
@@ -668,68 +433,32 @@ fn render_config_h(probes: &[Probe], features: &Features) -> String {
 // Cargo output
 // ---------------------------------------------------------------------------
 
-/// Link directives `cc` does not emit for us: system frameworks and the
-/// libraries `pkg-config` reported.
-fn emit_extra_link_directives(features: &Features) {
-    if features.coretext {
-        // ApplicationServices umbrella-links CoreText, CoreGraphics, and
-        // CoreFoundation on macOS. iOS-family targets expose them separately.
-        if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-            println!("cargo::rustc-link-lib=framework=ApplicationServices");
-        } else {
-            for framework in ["CoreText", "CoreGraphics", "CoreFoundation"] {
-                println!("cargo::rustc-link-lib=framework={framework}");
-            }
-        }
+/// Apple system frameworks, which have no `pkg-config` entry.
+fn emit_framework_directives(features: &Features) {
+    if !features.coretext {
+        return;
     }
 
-    for pkg in features.pkg_configs() {
-        if pkg.libs.is_empty() {
-            println!(
-                "cargo::warning=harfbuzz-sys: `pkg-config --libs {}` returned nothing; the link \
-                 step will probably report undefined symbols.",
-                pkg.name
-            );
-        }
-
-        for flag in &pkg.libs {
-            if let Some(lib) = flag.strip_prefix("-l") {
-                println!("cargo::rustc-link-lib={lib}");
-            } else if let Some(dir) = flag.strip_prefix("-L") {
-                println!("cargo::rustc-link-search=native={dir}");
-            } else if let Some(framework) = flag.strip_prefix("-framework") {
-                let framework = framework.trim();
-                if !framework.is_empty() {
-                    println!("cargo::rustc-link-lib=framework={framework}");
-                }
-            }
+    // ApplicationServices umbrella-links CoreText, CoreGraphics, and
+    // CoreFoundation on macOS. iOS-family targets expose them separately.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo::rustc-link-lib=framework=ApplicationServices");
+    } else {
+        for framework in ["CoreText", "CoreGraphics", "CoreFoundation"] {
+            println!("cargo::rustc-link-lib=framework={framework}");
         }
     }
 }
 
 /// Hand `tests/symbols.rs` what it needs to check every declared binding
 /// against the symbols the archive actually defines.
-///
-/// The reader defaults to `nm`, which is right for the ordinary build. Under
-/// `-Clinker-plugin-lto` the archive members are bitcode and need `llvm-nm`
-/// instead; `NM` selects it, the same way `AR` selects the archiver.
 fn emit_test_env(out_dir: &Path) {
     println!(
         "cargo::rustc-env=HARFBUZZ_SYS_ARCHIVE={}",
         out_dir.join("libharfbuzz.a").display()
     );
-    println!("cargo::rerun-if-env-changed=NM");
     println!(
         "cargo::rustc-env=HARFBUZZ_SYS_NM={}",
         env::var("NM").unwrap_or_else(|_| "nm".to_string())
     );
-}
-
-/// Publish what we did to dependent build scripts.
-///
-/// Because this package declares `links = "harfbuzz"`, Cargo forwards each of
-/// these to dependents as `DEP_HARFBUZZ_<KEY>`.
-fn emit_metadata(hb_src: &Path, kind: CompilerKind) {
-    println!("cargo::metadata=include={}", hb_src.display());
-    println!("cargo::metadata=compiler={:?}", kind);
 }

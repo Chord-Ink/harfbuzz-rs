@@ -6,7 +6,6 @@
 
 use core::ffi::{c_float, c_int, c_uint, c_void};
 
-use crate::opaque_handle;
 use crate::{
     HB_TAG, hb_blob_t, hb_bool_t, hb_codepoint_t, hb_color_t, hb_destroy_func_t, hb_draw_funcs_t,
     hb_font_t, hb_glyph_extents_t, hb_tag_t, hb_user_data_key_t,

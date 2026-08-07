@@ -4,7 +4,7 @@ use core::ffi::{c_int, c_uint, c_void};
 
 use crate::{
     HB_CODEPOINT_INVALID, hb_bool_t, hb_codepoint_t, hb_destroy_func_t, hb_set_t,
-    hb_user_data_key_t, opaque_handle,
+    hb_user_data_key_t,
 };
 
 /// An unset [`hb_map_t`] value.

@@ -7,7 +7,6 @@ use crate::{
     HB_DIRECTION_INVALID, HB_LANGUAGE_INVALID, HB_SCRIPT_INVALID, HB_TAG, HB_TAG_NONE, hb_bool_t,
     hb_codepoint_t, hb_destroy_func_t, hb_direction_t, hb_font_t, hb_language_t, hb_mask_t,
     hb_position_t, hb_script_t, hb_unicode_funcs_t, hb_user_data_key_t, hb_var_int_t,
-    opaque_handle,
 };
 
 /// Information about a single glyph and its relation to the input text.

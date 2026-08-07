@@ -18,9 +18,12 @@ exclude = ["harfbuzz/test", "harfbuzz/perf", "harfbuzz/docs", "harfbuzz/util"]
 # translation, and archiver selection. HarfBuzz is C++, so the build uses
 # `cc::Build::cpp(true)`, which reads `CXX` rather than `CC`.
 cc = "1"
+# Locating the optional system libraries behind the freetype/icu/glib/graphite2/
+# png/zlib features, and emitting their link directives.
+pkg-config = "0.3"
 
 [features]
-default = ["subset", "debug"]
+default = []
 
 # --- HarfBuzz sub-libraries -------------------------------------------------
 # These map one-to-one onto upstream's `HB_HAS_*` build switches. Each adds

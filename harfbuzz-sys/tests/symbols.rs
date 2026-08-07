@@ -78,6 +78,12 @@ fn feature_modules() -> Vec<&'static str> {
 struct Declaration {
     name: String,
     module: String,
+    /// True when the declaration carries a `#[cfg(...)]`. Whether such a
+    /// function is compiled depends on flags this test cannot resolve from
+    /// source text, so the forward check skips them — but the coverage report
+    /// still counts them as declared, or every experimental binding would look
+    /// like a gap.
+    cfg_gated: bool,
 }
 
 /// Scan one module for the names inside its `unsafe extern "C"` blocks.
@@ -122,17 +128,16 @@ fn declarations_in(path: &Path) -> Vec<Declaration> {
         }
 
         if let Some(rest) = trimmed.strip_prefix("pub fn ") {
-            if !cfg_gated {
-                let name: String = rest
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                if !name.is_empty() {
-                    declarations.push(Declaration {
-                        name,
-                        module: module.clone(),
-                    });
-                }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                declarations.push(Declaration {
+                    name,
+                    module: module.clone(),
+                    cfg_gated,
+                });
             }
             cfg_gated = false;
         } else if !trimmed.is_empty() && !trimmed.starts_with("///") && !trimmed.starts_with("//") {
@@ -202,6 +207,7 @@ fn every_declared_function_exists_in_the_archive() {
 
     let missing: Vec<&Declaration> = declarations
         .iter()
+        .filter(|d| !d.cfg_gated)
         .filter(|d| !defined.contains(&d.name))
         .collect();
 

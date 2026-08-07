@@ -5,7 +5,7 @@ use core::ffi::{c_char, c_int, c_uint, c_void};
 
 use crate::{
     hb_bool_t, hb_buffer_t, hb_destroy_func_t, hb_face_t, hb_feature_t, hb_font_t,
-    hb_segment_properties_t, hb_user_data_key_t, opaque_handle,
+    hb_segment_properties_t, hb_user_data_key_t,
 };
 
 opaque_handle! {
