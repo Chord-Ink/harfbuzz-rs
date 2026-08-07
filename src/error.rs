@@ -51,6 +51,15 @@ pub enum Error {
     /// ASCII range that OpenType tags are limited to.
     InvalidTag,
 
+    /// A string did not name a text direction.
+    InvalidDirection,
+
+    /// A string was not a usable BCP 47 language tag.
+    InvalidLanguage,
+
+    /// A string was not a usable script name or ISO 15924 tag.
+    InvalidScript,
+
     /// A feature string such as `"kern"` or `"-liga"` could not be parsed.
     InvalidFeature,
 
@@ -88,6 +97,11 @@ impl fmt::Display for Error {
             Self::InvalidTag => {
                 f.write_str("a tag must be one to four printable ASCII characters")
             }
+            Self::InvalidDirection => {
+                f.write_str("expected one of \"ltr\", \"rtl\", \"ttb\", or \"btt\"")
+            }
+            Self::InvalidLanguage => f.write_str("not a usable BCP 47 language tag"),
+            Self::InvalidScript => f.write_str("not a usable script name or ISO 15924 tag"),
             Self::InvalidFeature => f.write_str("the feature string could not be parsed"),
             Self::InvalidVariation => f.write_str("the variation string could not be parsed"),
             Self::InvalidText => f.write_str("the text was not valid Unicode"),
