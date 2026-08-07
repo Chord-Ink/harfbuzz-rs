@@ -131,7 +131,7 @@ Every public item in the crate, and the page that explains it.
 | `Buffer`, `GlyphBuffer` | objects | [text-and-buffers.md](text-and-buffers.md) |
 | `GlyphInfo`, `GlyphPosition` | output data | [text-and-buffers.md](text-and-buffers.md#reading-the-output) |
 | `FontExtents`, `GlyphExtents` | metrics | [fonts-and-sizing.md](fonts-and-sizing.md#metrics) |
-| `shape`, `shapers` | functions | [getting-started.md](getting-started.md#step-4-shape) |
+| `shape`, `shapers` | functions | [getting-started.md](getting-started.md#step-4--shape) |
 | `buffer_from` | function | [text-and-buffers.md](text-and-buffers.md#adding-text) |
 | `points_to_scale` | function | [fonts-and-sizing.md](fonts-and-sizing.md#scale-and-the-266-convention) |
 | `version`, `version_at_least` | functions | [below](#version) |
@@ -146,10 +146,12 @@ Every public item in the crate, and the page that explains it.
 ## Version
 
 ```rust
-let (major, minor, micro) = harfbuzz_rs::version();
-assert!(major >= 14);
+fn main() {
+    let (major, _minor, _micro) = harfbuzz_rs::version();
+    assert!(major >= 14);
 
-assert!(harfbuzz_rs::version_at_least(14, 0, 0));
+    assert!(harfbuzz_rs::version_at_least(14, 0, 0));
+}
 ```
 
 These report the version of the **vendored HarfBuzz** the crate was compiled

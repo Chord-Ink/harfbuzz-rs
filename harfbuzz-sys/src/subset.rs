@@ -809,6 +809,9 @@ unsafe extern "C" {
     /// `HB_NO_SUBSET_DEPEND` unless `HB_EXPERIMENTAL_API` is set, so without it
     /// this symbol is not compiled into the library at all.
     ///
+    /// `HB_LEAN` defines it a second time, so combining `experimental` with
+    /// `lean` or `tiny` leaves this declared but unlinkable.
+    ///
     /// Since HarfBuzz 14.3.0.
     #[cfg(feature = "experimental")]
     pub fn hb_subset_depend_from_face_or_fail(face: *mut hb_face_t) -> *mut hb_subset_depend_t;

@@ -84,6 +84,9 @@ use harfbuzz_rs::{Face, IntoShared};
 
 fn main() -> harfbuzz_rs::Result<()> {
     let face = Face::from_file("font.ttf", 0)?.into_shared();
+
+    let another_handle = face.clone();      // cheap: no data is copied
+    assert_eq!(face.upem(), another_handle.upem());
     Ok(())
 }
 ```
@@ -111,6 +114,8 @@ fn main() -> harfbuzz_rs::Result<()> {
 
     let face = face.into_shared();
     // face.set_upem(2048);   <- does not compile
+
+    assert_eq!(face.upem(), 1000);
     Ok(())
 }
 ```
