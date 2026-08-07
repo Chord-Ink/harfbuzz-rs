@@ -165,12 +165,13 @@ The safe API deliberately covers the shaping path and little else. Everything
 HarfBuzz exposes is still reachable through the re-exported `harfbuzz_sys`:
 
 ```rust
-use harfbuzz_rs::{Face, HarfBuzzObject, sys};
+use harfbuzz_rs::{Font, HarfBuzzObject, sys};
 
-fn table_count(face: &Face) -> u32 {
-    // SAFETY: `face` owns a live `hb_face_t` for the duration of the call, and
-    // this function only reads from it.
-    unsafe { sys::hb_face_get_table_tags(face.as_raw(), 0, &mut 0, core::ptr::null_mut()) }
+/// A glyph's vertical advance — a metric the safe API does not wrap.
+fn glyph_v_advance(font: &Font, glyph: u32) -> i32 {
+    // SAFETY: `font` owns a live `hb_font_t` for the duration of the call, the
+    // glyph id is a plain integer, and the function only reads from the font.
+    unsafe { sys::hb_font_get_glyph_v_advance(font.as_raw(), glyph) }
 }
 ```
 
